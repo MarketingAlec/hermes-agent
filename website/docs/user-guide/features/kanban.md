@@ -764,7 +764,7 @@ hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events 
 hermes kanban heartbeat <id> [--note "..."]            # worker liveness signal for long ops
 hermes kanban runs <id> [--json]                       # attempt history (one row per run)
 hermes kanban assignees [--json]                       # profiles on disk + per-assignee task counts
-hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass
+hermes kanban dispatch [--dry-run] [--max N] [--task-id TASK_ID]  # one-shot pass
         [--failure-limit N] [--json]
 hermes kanban daemon --force                           # DEPRECATED — standalone dispatcher (use `hermes gateway start` instead)
         [--failure-limit N] [--pidfile PATH] [-v]
@@ -784,6 +784,20 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
+
+`dispatch --task-id TASK_ID` selects exactly one existing `ready` or `review`
+task with no live claim. It never falls back to the queue and does not run
+board-wide maintenance (promotion, stale/orphan/crash reconciliation, WAL
+checkpointing, or dispatch-tick hooks). The selected task still obeys parent,
+review, profile, concurrency, respawn, workspace, atomic-claim, and spawn
+failure rules. A targeted `--dry-run` opens an already initialized database
+with SQLite's supported read-only mode, including committed WAL state, predicts
+only an eligible selected task, and changes no logical board, schema,
+configuration, profile, or worker state. Missing or outdated databases, lock
+resolution/contention, and unreadable boards needed for host-cap accounting are
+refused. SQLite may create or update its transient WAL/SHM/lock coordination
+metadata during a normal read-only connection; the dispatcher may likewise
+create its transient board-scoped dispatch lock file.
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 

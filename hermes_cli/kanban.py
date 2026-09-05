@@ -19,10 +19,13 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+import yaml
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
@@ -793,6 +796,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
+    p_disp.add_argument("--task-id", default=None,
+                        help="Dispatch only this exact ready/review task")
     p_disp.add_argument("--max", type=int, default=None,
                         help="Cap number of spawns this pass")
     p_disp.add_argument("--failure-limit", type=int,
@@ -2725,8 +2730,18 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # matches whether the user runs the CLI directly or relies on the
     # gateway-embedded dispatcher.
     try:
-        from hermes_cli.config import load_config
-        _cfg = load_config()
+        if getattr(args, "task_id", None) is not None:
+            config_path = Path(
+                os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+            ) / "config.yaml"
+            if config_path.is_file():
+                with config_path.open(encoding="utf-8") as config_file:
+                    _cfg = yaml.safe_load(config_file) or {}
+            else:
+                _cfg = {}
+        else:
+            from hermes_cli.config import load_config
+            _cfg = load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
 
@@ -2746,7 +2761,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # Memory-derived default when unset (OOF-30/OOF-77) — same
         # fallback the gateway-embedded dispatcher applies, so behaviour
         # matches regardless of which path runs the tick.
-        max_in_progress = kb.resolve_max_in_progress(max_in_progress)
+        if getattr(args, "task_id", None) is None:
+            max_in_progress = kb.resolve_max_in_progress(max_in_progress)
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2758,9 +2774,39 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
-    with kb.connect_closing() as conn:
+    task_id = getattr(args, "task_id", None)
+    if task_id is not None:
+        try:
+            db_path = kb.kanban_db_path()
+            if not db_path.is_file():
+                print(f"Targeted dispatch refused: database is not initialized: {db_path}", file=sys.stderr)
+                return 2
+            conn = sqlite3.connect(
+                f"file:{db_path.expanduser().resolve()}?mode=ro"
+                if args.dry_run else str(db_path),
+                uri=bool(args.dry_run),
+            )
+            conn.row_factory = sqlite3.Row
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )}
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+            required_tables = {"tasks", "task_links", "task_runs", "task_events"}
+            required_columns = set(kb.Task.__dataclass_fields__)
+            if not required_tables.issubset(tables) or not required_columns.issubset(columns):
+                conn.close()
+                print("Targeted dispatch refused: database schema is not initialized/current", file=sys.stderr)
+                return 2
+        except Exception as exc:
+            print(f"Targeted dispatch refused: {exc}", file=sys.stderr)
+            return 2
+        context = contextlib.closing(conn)
+    else:
+        context = kb.connect_closing()
+    with context as conn:
         res = kb.dispatch_once(
             conn,
+            task_id=task_id,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
@@ -2787,8 +2833,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "target_error": res.target_error,
         }, indent=2))
-        return 0
+        return 2 if task_id is not None and res.target_error else 0
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
@@ -2824,6 +2871,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if task_id is not None and res.target_error:
+        print(f"Targeted dispatch refused: {res.target_error}", file=sys.stderr)
+        return 2
     return 0
 
 

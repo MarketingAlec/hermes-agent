@@ -8093,6 +8093,8 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    target_error: Optional[str] = None
+    """Fail-closed reason for an explicitly selected task."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9605,7 +9607,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
-def review_dispatch_enabled() -> bool:
+def review_dispatch_enabled(*, readonly: bool = False) -> bool:
     """Return whether first-class review tasks should dispatch automatically.
 
     The default is true because Hermes ships the ``sdlc-review`` skill and the
@@ -9613,10 +9615,19 @@ def review_dispatch_enabled() -> bool:
     transition. Operators can disable it for human-only review boards.
     """
     try:
-        from hermes_cli.config import load_config
-        return bool(
-            (load_config() or {}).get("kanban", {}).get("review_dispatch", True)
-        )
+        if readonly:
+            import yaml
+            config_path = Path(
+                os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+            ) / "config.yaml"
+            if not config_path.is_file():
+                return True
+            with config_path.open(encoding="utf-8") as config_file:
+                config = yaml.safe_load(config_file) or {}
+        else:
+            from hermes_cli.config import load_config
+            config = load_config() or {}
+        return bool(config.get("kanban", {}).get("review_dispatch", True))
     except Exception:
         return True
 
@@ -9830,6 +9841,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    task_id: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9846,6 +9858,24 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    if task_id is not None:
+        if not isinstance(task_id, str) or not task_id.strip() or any(c.isspace() for c in task_id):
+            return DispatchResult(target_error="task id must be a non-empty token")
+        try:
+            db_path = kanban_db_path(board=board)
+        except Exception:
+            return DispatchResult(target_error="dispatch lock path unavailable")
+        with _dispatch_tick_lock(db_path) as held:
+            if not held:
+                return DispatchResult(skipped_locked=True, target_error="dispatch lock is held")
+            return _dispatch_target_locked(
+                conn, task_id=task_id, spawn_fn=spawn_fn,
+                ttl_seconds=ttl_seconds, dry_run=dry_run,
+                max_spawn=max_spawn, max_in_progress=max_in_progress,
+                failure_limit=failure_limit, board=board,
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+            )
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -9896,6 +9926,166 @@ def dispatch_once(
     # the lock hold and stall a sibling dispatcher's tick.
     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
+
+
+def _dispatch_target_locked(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    dry_run: bool = False,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    board: Optional[str] = None,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> DispatchResult:
+    """Dispatch one exact task without running board-wide tick maintenance."""
+    result = DispatchResult()
+    row = conn.execute(
+        "SELECT id, status, assignee, claim_lock FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        result.target_error = f"task {task_id} not found"
+        return result
+    if row["status"] not in {"ready", "review"}:
+        result.target_error = f"task {task_id} is not ready or review"
+        return result
+    if row["claim_lock"] is not None:
+        result.target_error = f"task {task_id} already has a live claim"
+        return result
+    if row["status"] == "review" and not review_dispatch_enabled(readonly=True):
+        result.target_error = "review dispatch is disabled"
+        return result
+    if not _parents_satisfied(conn, task_id):
+        result.target_error = "unsatisfied parent dependencies"
+        return result
+
+    assignee = (row["assignee"] or "").strip()
+    fallback = (default_assignee or "").strip()
+    if not assignee and fallback:
+        assignee = fallback
+        result.auto_assigned_default.append(task_id)
+    if not assignee:
+        result.skipped_unassigned.append(task_id)
+        result.target_error = "task has no assignee"
+        return result
+    if not _target_profile_exists_readonly(assignee):
+        result.skipped_nonspawnable.append(task_id)
+        result.target_error = f"assignee {assignee!r} is not a Hermes profile"
+        return result
+
+    running = count_running_tasks(conn)
+    if max_spawn is not None and running >= max_spawn:
+        result.target_error = "board concurrency cap reached"
+        return result
+    if max_in_progress is not None:
+        try:
+            total = running + count_running_tasks_other_boards_readonly(board)
+        except Exception:
+            result.target_error = "cannot verify host concurrency cap"
+            return result
+        if total >= max_in_progress:
+            result.target_error = "host concurrency cap reached"
+            return result
+    if max_in_progress_per_profile is not None and max_in_progress_per_profile > 0:
+        current = int(conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND assignee = ?",
+            (assignee,),
+        ).fetchone()[0])
+        if current >= max_in_progress_per_profile:
+            result.skipped_per_profile_capped.append((task_id, assignee, current))
+            result.target_error = "per-profile concurrency cap reached"
+            return result
+    guard_reason = check_respawn_guard(
+        conn, task_id, lane="review" if row["status"] == "review" else "ready"
+    )
+    if guard_reason is not None:
+        result.respawn_guarded.append((task_id, guard_reason))
+        result.target_error = f"respawn guarded: {guard_reason}"
+        return result
+    if dry_run:
+        result.spawned.append((task_id, assignee, ""))
+        return result
+
+    if not row["assignee"] and fallback:
+        with write_txn(conn):
+            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (fallback, task_id))
+            _append_event(conn, task_id, "assigned", {
+                "assignee": fallback, "source": "kanban.default_assignee",
+            })
+    claim = claim_review_task if row["status"] == "review" else claim_task
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    if claimed is None:
+        result.target_error = "task became ineligible before claim"
+        return result
+    try:
+        resolved_branch_name = None
+        if claimed.workspace_kind == "worktree":
+            workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+        else:
+            workspace = resolve_workspace(claimed, board=board)
+        set_workspace_path(conn, claimed.id, str(workspace))
+        if claimed.workspace_kind == "worktree":
+            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if row["status"] == "review":
+            claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        import inspect
+        try:
+            sig = inspect.signature(_spawn)
+            pid = _spawn(claimed, str(workspace), board=board) if "board" in sig.parameters else _spawn(claimed, str(workspace))
+        except (TypeError, ValueError):
+            pid = _spawn(claimed, str(workspace))
+        if pid:
+            _set_worker_pid(conn, claimed.id, int(pid))
+        _fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+    except Exception as exc:
+        if _record_spawn_failure(conn, claimed.id, str(exc), failure_limit=failure_limit):
+            result.auto_blocked.append(claimed.id)
+        result.target_error = f"spawn failed: {exc}"
+    return result
+
+
+def _target_profile_exists_readonly(name: str) -> bool:
+    """Check dispatch profile presence without importing profile setup code."""
+    canonical = name.strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", canonical):
+        return False
+    if canonical == "default":
+        return True
+    try:
+        root = Path(os.environ.get("HERMES_HOME", "")).expanduser()
+        return (root / "profiles" / canonical).is_dir()
+    except Exception:
+        return False
+
+
+def count_running_tasks_other_boards_readonly(board: Optional[str] = None) -> int:
+    """Count other-board workers read-only; refuse incomplete evidence."""
+    try:
+        current = kanban_db_path(board=board).expanduser().resolve()
+        boards = list_boards(include_archived=False)
+    except Exception as exc:
+        raise RuntimeError("cannot enumerate boards for host cap") from exc
+    total = 0
+    for meta in boards:
+        try:
+            path = kanban_db_path(board=meta.get("slug") or DEFAULT_BOARD).expanduser().resolve()
+            if path == current or not path.is_file():
+                continue
+            other = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                total += int(other.execute("SELECT COUNT(*) FROM tasks WHERE status='running'").fetchone()[0])
+            finally:
+                other.close()
+        except Exception as exc:
+            raise RuntimeError(f"cannot read board {meta.get('slug')!r} for host cap") from exc
+    return total
 
 
 def _dispatch_once_locked(
