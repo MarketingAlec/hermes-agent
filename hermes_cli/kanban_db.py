@@ -1692,12 +1692,14 @@ def _cross_process_init_lock(path: Path):
 
 
 @contextlib.contextmanager
-def _dispatch_tick_lock(db_path: Path):
+def _dispatch_tick_lock(db_path: Path, *, strict: bool = False):
     """Non-blocking single-writer guard around one dispatcher tick.
 
     Yields ``True`` when this process holds the board's dispatch lock and
     may proceed with the tick, or ``False`` when another process already
-    holds it (the caller should skip the tick this round).
+    holds it. With ``strict=True``, yields ``None`` if the lock sidecar cannot
+    be opened; selected dispatch uses this to fail closed while legacy queue
+    ticks retain their historical best-effort behavior.
 
     Motivation (issue #35240): a ``hermes gateway run --replace`` /
     ``gateway restart`` invoked from a shell on a systemd/launchd host can
@@ -1751,7 +1753,7 @@ def _dispatch_tick_lock(db_path: Path):
     except OSError:
         # Could not even open the lock file (permissions, read-only FS).
         # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        acquired = None if strict else True
         handle = None
     try:
         yield acquired
@@ -4631,6 +4633,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4641,6 +4644,14 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if expected_assignee is not None:
+            admitted = conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ? AND status = 'ready' "
+                "AND claim_lock IS NULL AND assignee = ?",
+                (task_id, expected_assignee),
+            ).fetchone()
+            if admitted is None:
+                return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4696,8 +4707,9 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND (? IS NULL OR assignee = ?)
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, expected_assignee, expected_assignee),
         )
         if cur.rowcount != 1:
             return None
@@ -4753,6 +4765,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4769,6 +4782,14 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if expected_assignee is not None:
+            admitted = conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ? AND status = 'review' "
+                "AND claim_lock IS NULL AND assignee = ?",
+                (task_id, expected_assignee),
+            ).fetchone()
+            if admitted is None:
+                return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4796,8 +4817,9 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND (? IS NULL OR assignee = ?)
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, expected_assignee, expected_assignee),
         )
         if cur.rowcount != 1:
             return None
@@ -9868,7 +9890,9 @@ def dispatch_once(
             db_path = kanban_db_path(board=board)
         except Exception:
             return DispatchResult(target_error="dispatch lock path unavailable")
-        with _dispatch_tick_lock(db_path) as held:
+        with _dispatch_tick_lock(db_path, strict=True) as held:
+            if held is None:
+                return DispatchResult(target_error="dispatch lock unavailable")
             if not held:
                 return DispatchResult(skipped_locked=True, target_error="dispatch lock is held")
             return _dispatch_target_locked(
@@ -9976,7 +10000,7 @@ def _dispatch_target_locked(
 
     assignee = (row["assignee"] or "").strip()
     fallback = (default_assignee or "").strip()
-    if not assignee and fallback:
+    if not assignee and fallback and row["status"] == "ready":
         assignee = fallback
         result.auto_assigned_default.append(task_id)
     if not assignee:
@@ -10031,12 +10055,22 @@ def _dispatch_target_locked(
 
     if not row["assignee"] and fallback:
         with write_txn(conn):
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (fallback, task_id))
+            updated = conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ? "
+                "AND status = 'ready' AND claim_lock IS NULL "
+                "AND (assignee IS NULL OR assignee = '')",
+                (fallback, task_id),
+            )
+            if updated.rowcount != 1:
+                result.target_error = "task changed during default assignment"
+                return result
             _append_event(conn, task_id, "assigned", {
                 "assignee": fallback, "source": "kanban.default_assignee",
             })
     claim = claim_review_task if row["status"] == "review" else claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    claimed = claim(
+        conn, task_id, ttl_seconds=ttl_seconds, expected_assignee=assignee,
+    )
     if claimed is None:
         result.target_error = "task became ineligible before claim"
         return result

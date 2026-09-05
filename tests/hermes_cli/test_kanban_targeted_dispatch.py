@@ -42,7 +42,21 @@ def test_parser_accepts_exact_task_selector():
 
 def test_targeted_dispatch_spawns_only_selected_and_skips_maintenance(board, monkeypatch):
     target = kb.create_task(board, title="target", assignee="default")
-    decoy = kb.create_task(board, title="decoy", assignee="default")
+    decoys = {
+        status: kb.create_task(board, title=f"decoy-{status}", assignee="default")
+        for status in ("ready", "todo", "running", "review", "done", "archived")
+    }
+    for status, task_id in decoys.items():
+        board.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    orphan = kb.create_task(board, title="decoy-orphan", assignee="default")
+    stale = kb.create_task(board, title="decoy-stale", assignee="default")
+    board.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (orphan,))
+    board.execute(
+        "UPDATE tasks SET status = 'running', claim_lock = 'old', claim_expires = 1 "
+        "WHERE id = ?", (stale,),
+    )
+    board.commit()
+    decoy_ids = [*decoys.values(), orphan, stale]
     forbidden = [
         "reap_worker_zombies", "release_stale_claims", "reconcile_orphaned_running",
         "detect_stale_running", "detect_crashed_workers", "enforce_max_runtime",
@@ -50,14 +64,7 @@ def test_targeted_dispatch_spawns_only_selected_and_skips_maintenance(board, mon
     ]
     for name in forbidden:
         monkeypatch.setattr(kb, name, lambda *a, _name=name, **k: pytest.fail(_name))
-    decoy_before = {
-        table: [tuple(r) for r in board.execute(
-            f"SELECT * FROM {table} WHERE task_id = ? ORDER BY 1", (decoy,)
-        )] if table != "tasks" else [tuple(board.execute(
-            "SELECT * FROM tasks WHERE id = ?", (decoy,)
-        ).fetchone())]
-        for table in ("tasks", "task_runs", "task_events")
-    }
+    before = _snapshot(board)
     spawned = []
     result = kb.dispatch_once(
         board, task_id=target,
@@ -66,16 +73,15 @@ def test_targeted_dispatch_spawns_only_selected_and_skips_maintenance(board, mon
     assert spawned == [target]
     assert [item[0] for item in result.spawned] == [target]
     assert kb.get_task(board, target).status == "running"
-    assert kb.get_task(board, decoy).status == "ready"
-    decoy_after = {
-        table: [tuple(r) for r in board.execute(
-            f"SELECT * FROM {table} WHERE task_id = ? ORDER BY 1", (decoy,)
-        )] if table != "tasks" else [tuple(board.execute(
-            "SELECT * FROM tasks WHERE id = ?", (decoy,)
-        ).fetchone())]
-        for table in ("tasks", "task_runs", "task_events")
-    }
-    assert decoy_after == decoy_before
+    after = _snapshot(board)
+    assert [kb.get_task(board, task_id).status for task_id in decoy_ids] == [
+        "ready", "todo", "running", "review", "done", "archived", "running", "running",
+    ]
+    for table in ("tasks", "task_runs", "task_events"):
+        target_index = 0 if table == "tasks" else 1
+        assert [row for row in after[table] if row[target_index] != target] == [
+            row for row in before[table] if row[target_index] != target
+        ]
 
 
 def test_targeted_dry_run_is_read_only_and_checks_parents(board):
@@ -131,6 +137,26 @@ def test_targeted_dispatch_refuses_lock_contention(board):
     assert kb.get_task(board, target).status == "ready"
 
 
+def test_targeted_dispatch_refuses_lockfile_open_failure(board, monkeypatch):
+    target = kb.create_task(board, title="target", assignee="default")
+    before = _snapshot(board)
+    original_open = __import__("pathlib").Path.open
+
+    def fail_lock_open(path, *args, **kwargs):
+        if path.name.endswith(".dispatch.lock"):
+            raise PermissionError("lock sidecar denied")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("pathlib.Path.open", fail_lock_open)
+    result = kb.dispatch_once(
+        board, task_id=target,
+        spawn_fn=lambda *a, **k: pytest.fail("spawned without lock"),
+    )
+    assert result.target_error == "dispatch lock unavailable"
+    assert result.spawned == []
+    assert _snapshot(board) == before
+
+
 @pytest.mark.parametrize("status", ["todo", "blocked", "done", "archived", "running"])
 def test_targeted_dispatch_refuses_ineligible_status(board, status):
     target = kb.create_task(board, title="target", assignee="default")
@@ -158,6 +184,93 @@ def test_targeted_review_obeys_review_lane_and_retry_does_not_duplicate(board):
     assert "sdlc-review" in spawned[0][1]
     assert second.spawned == []
     assert second.target_error
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_targeted_unassigned_review_does_not_use_default(board, dry_run):
+    target = kb.create_task(board, title="review", assignee=None)
+    board.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (target,))
+    board.commit()
+    before = _snapshot(board)
+    result = kb.dispatch_once(
+        board, task_id=target, dry_run=dry_run, default_assignee="default",
+        spawn_fn=lambda *a, **k: pytest.fail("unowned review spawned"),
+    )
+    assert result.target_error == "task has no assignee"
+    assert result.auto_assigned_default == []
+    assert _snapshot(board) == before
+
+
+@pytest.mark.parametrize("race", ["assign", "claim"])
+def test_targeted_default_assignment_losing_race_preserves_new_owner_or_claim(
+    board, monkeypatch, race,
+):
+    target = kb.create_task(board, title="target", assignee=None)
+    db_path = board.execute("PRAGMA database_list").fetchone()[2]
+    competitor = sqlite3.connect(db_path)
+    competitor.row_factory = sqlite3.Row
+
+    def race_after_admission():
+        if race == "assign":
+            competitor.execute(
+                "UPDATE tasks SET assignee = 'other' WHERE id = ?", (target,)
+            )
+            competitor.commit()
+        else:
+            kb.claim_task(competitor, target, claimer="competitor")
+        return "ok"
+
+    monkeypatch.setattr(kb, "_memory_pressure_level", race_after_admission)
+    try:
+        result = kb.dispatch_once(
+            board, task_id=target, default_assignee="default",
+            spawn_fn=lambda *a, **k: pytest.fail("stale admission spawned"),
+        )
+    finally:
+        competitor.close()
+    row = board.execute(
+        "SELECT assignee, status, claim_lock FROM tasks WHERE id = ?", (target,)
+    ).fetchone()
+    assert result.target_error == "task changed during default assignment"
+    assert result.spawned == []
+    if race == "assign":
+        assert tuple(row) == ("other", "ready", None)
+    else:
+        assert tuple(row) == (None, "running", "competitor")
+    assigned_events = board.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'assigned'",
+        (target,),
+    ).fetchone()[0]
+    assert assigned_events == 0
+
+
+def test_targeted_assigned_task_refuses_owner_change_before_atomic_claim(
+    board, monkeypatch,
+):
+    target = kb.create_task(board, title="target", assignee="default")
+    db_path = board.execute("PRAGMA database_list").fetchone()[2]
+    competitor = sqlite3.connect(db_path)
+
+    def change_owner_after_admission():
+        competitor.execute(
+            "UPDATE tasks SET assignee = 'other' WHERE id = ?", (target,)
+        )
+        competitor.commit()
+        return "ok"
+
+    monkeypatch.setattr(kb, "_memory_pressure_level", change_owner_after_admission)
+    try:
+        result = kb.dispatch_once(
+            board, task_id=target,
+            spawn_fn=lambda *a, **k: pytest.fail("spawned for stale owner"),
+        )
+    finally:
+        competitor.close()
+    row = board.execute(
+        "SELECT assignee, status, claim_lock FROM tasks WHERE id = ?", (target,)
+    ).fetchone()
+    assert result.target_error == "task became ineligible before claim"
+    assert tuple(row) == ("other", "ready", None)
 
 
 def test_targeted_dispatch_obeys_capacity_caps(board):
