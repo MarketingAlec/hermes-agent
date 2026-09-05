@@ -2729,8 +2729,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # (#28805). Same semantics as the gateway dispatch path so behavior
     # matches whether the user runs the CLI directly or relies on the
     # gateway-embedded dispatcher.
+    task_id = getattr(args, "task_id", None)
     try:
-        if getattr(args, "task_id", None) is not None:
+        if task_id is not None:
             config_path = Path(
                 os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
             ) / "config.yaml"
@@ -2739,11 +2740,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                     _cfg = yaml.safe_load(config_file) or {}
             else:
                 _cfg = {}
+            if not isinstance(_cfg, dict):
+                raise ValueError("config root must be a mapping")
         else:
             from hermes_cli.config import load_config
             _cfg = load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        if task_id is not None and not isinstance(_kanban_cfg, dict):
+            raise ValueError("kanban config must be a mapping")
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
+        review_dispatch = bool(_kanban_cfg.get("review_dispatch", True))
 
         def _coerce_positive_int(value):
             if value is None:
@@ -2761,20 +2767,22 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # Memory-derived default when unset (OOF-30/OOF-77) — same
         # fallback the gateway-embedded dispatcher applies, so behaviour
         # matches regardless of which path runs the tick.
-        if getattr(args, "task_id", None) is None:
-            max_in_progress = kb.resolve_max_in_progress(max_in_progress)
+        max_in_progress = kb.resolve_max_in_progress(max_in_progress)
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
-    except Exception:
+    except Exception as exc:
+        if task_id is not None:
+            print(f"Targeted dispatch refused: cannot read dispatch configuration: {exc}", file=sys.stderr)
+            return 2
         default_assignee = None
+        review_dispatch = True
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
-    task_id = getattr(args, "task_id", None)
     if task_id is not None:
         try:
             db_path = kb.kanban_db_path()
@@ -2813,6 +2821,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            review_dispatch=review_dispatch,
         )
     if getattr(args, "json", False):
         print(json.dumps({

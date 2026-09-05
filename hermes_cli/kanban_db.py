@@ -9629,6 +9629,8 @@ def review_dispatch_enabled(*, readonly: bool = False) -> bool:
             config = load_config() or {}
         return bool(config.get("kanban", {}).get("review_dispatch", True))
     except Exception:
+        if readonly:
+            raise
         return True
 
 
@@ -9842,6 +9844,7 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     task_id: Optional[str] = None,
+    review_dispatch: Optional[bool] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9875,6 +9878,7 @@ def dispatch_once(
                 failure_limit=failure_limit, board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
+                review_dispatch=review_dispatch,
             )
     try:
         db_path = kanban_db_path(board=board)
@@ -9941,6 +9945,7 @@ def _dispatch_target_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    review_dispatch: Optional[bool] = None,
 ) -> DispatchResult:
     """Dispatch one exact task without running board-wide tick maintenance."""
     result = DispatchResult()
@@ -9956,9 +9961,15 @@ def _dispatch_target_locked(
     if row["claim_lock"] is not None:
         result.target_error = f"task {task_id} already has a live claim"
         return result
-    if row["status"] == "review" and not review_dispatch_enabled(readonly=True):
-        result.target_error = "review dispatch is disabled"
-        return result
+    if row["status"] == "review":
+        try:
+            enabled = review_dispatch if review_dispatch is not None else review_dispatch_enabled(readonly=True)
+        except Exception:
+            result.target_error = "cannot read dispatch configuration"
+            return result
+        if not enabled:
+            result.target_error = "review dispatch is disabled"
+            return result
     if not _parents_satisfied(conn, task_id):
         result.target_error = "unsatisfied parent dependencies"
         return result
@@ -9976,6 +9987,14 @@ def _dispatch_target_locked(
         result.skipped_nonspawnable.append(task_id)
         result.target_error = f"assignee {assignee!r} is not a Hermes profile"
         return result
+
+    pressure = _memory_pressure_level()
+    if pressure == "critical":
+        result.memory_pressure = pressure
+        result.target_error = "system memory pressure is critical"
+        return result
+    if pressure == "elevated":
+        result.memory_pressure = pressure
 
     running = count_running_tasks(conn)
     if max_spawn is not None and running >= max_spawn:
@@ -10059,8 +10078,9 @@ def _target_profile_exists_readonly(name: str) -> bool:
     if canonical == "default":
         return True
     try:
-        root = Path(os.environ.get("HERMES_HOME", "")).expanduser()
-        return (root / "profiles" / canonical).is_dir()
+        from hermes_constants import get_default_hermes_root, named_profile_is_deleted
+        profile = get_default_hermes_root() / "profiles" / canonical
+        return profile.is_dir() and not named_profile_is_deleted(profile)
     except Exception:
         return False
 

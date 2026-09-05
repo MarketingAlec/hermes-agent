@@ -184,6 +184,15 @@ def test_targeted_dispatch_obeys_board_and_host_caps(board, monkeypatch):
     assert host_cap.target_error == "host concurrency cap reached"
 
 
+def test_targeted_dispatch_preserves_critical_memory_pressure_guard(board, monkeypatch):
+    target = kb.create_task(board, title="target", assignee="default")
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "critical")
+    result = kb.dispatch_once(board, task_id=target, dry_run=True)
+    assert result.spawned == []
+    assert result.memory_pressure == "critical"
+    assert result.target_error == "system memory pressure is critical"
+
+
 def test_cli_targeted_dry_run_refuses_missing_db_without_creating_it(tmp_path, monkeypatch, capsys):
     missing = tmp_path / "missing" / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(missing))
@@ -231,6 +240,10 @@ def test_cli_targeted_dry_run_does_not_initialize_config_or_write_db(tmp_path, m
     with sqlite3.connect(db_path) as check:
         check.row_factory = sqlite3.Row
         before = _snapshot(check)
+    before_profile_paths = sorted(
+        str(path.relative_to(home)) for path in home.rglob("*")
+        if not path.name.startswith("kanban.db")
+    )
     args = argparse.Namespace(
         task_id=target, dry_run=True, max=None,
         failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT, json=False,
@@ -240,6 +253,12 @@ def test_cli_targeted_dry_run_does_not_initialize_config_or_write_db(tmp_path, m
         check.row_factory = sqlite3.Row
         assert _snapshot(check) == before
     assert not (home / "config.yaml").exists()
+    after_profile_paths = sorted(
+        str(path.relative_to(home)) for path in home.rglob("*")
+        if not path.name.startswith("kanban.db")
+        and not path.name.endswith(".dispatch.lock")
+    )
+    assert after_profile_paths == before_profile_paths
 
 
 def test_cli_targeted_dry_run_reads_committed_uncheckpointed_wal(tmp_path, monkeypatch):
@@ -267,6 +286,80 @@ def test_cli_targeted_dry_run_reads_committed_uncheckpointed_wal(tmp_path, monke
         assert cli._cmd_dispatch(args) == 0
     finally:
         writer.close()
+
+
+def test_cli_targeted_dispatch_uses_memory_derived_host_cap(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    db_path = home / "kanban.db"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(
+        kb, "_system_memory_sample", lambda: {"mem_total_kib": 1024 * 1024}
+    )
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        for index in range(2):
+            running = kb.create_task(conn, title=f"running-{index}", assignee="default")
+            kb.claim_task(conn, running)
+        target = kb.create_task(conn, title="target", assignee="default")
+    args = argparse.Namespace(
+        task_id=target, dry_run=True, max=None,
+        failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT, json=False,
+    )
+    assert cli._cmd_dispatch(args) == 2
+
+
+def test_target_profile_resolution_uses_canonical_home_and_tombstones(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    profile = tmp_path / ".hermes" / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    assert kb._target_profile_exists_readonly("worker") is True
+    tombstone = profile.parent / ".deleted" / "worker"
+    tombstone.parent.mkdir()
+    tombstone.write_text("deleted\n", encoding="utf-8")
+    assert kb._target_profile_exists_readonly("worker") is False
+
+
+@pytest.mark.parametrize("status", ["ready", "review"])
+def test_cli_targeted_dispatch_refuses_unreadable_config(board, monkeypatch, status, capsys):
+    target = kb.create_task(board, title="target", assignee="default")
+    board.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, target))
+    board.commit()
+    config_path = board.execute("PRAGMA database_list").fetchone()[2]
+    home = __import__("pathlib").Path(config_path).parent
+    (home / "config.yaml").write_text("kanban:\n  review_dispatch: false\n", encoding="utf-8")
+    original_open = __import__("pathlib").Path.open
+
+    def refuse_config(path, *args, **kwargs):
+        if path.name == "config.yaml":
+            raise PermissionError("unreadable")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("pathlib.Path.open", refuse_config)
+    args = argparse.Namespace(
+        task_id=target, dry_run=True, max=None,
+        failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT, json=False,
+    )
+    assert cli._cmd_dispatch(args) == 2
+    assert "cannot read dispatch configuration" in capsys.readouterr().err
+
+
+def test_cli_targeted_dispatch_refuses_malformed_config(board, capsys):
+    target = kb.create_task(board, title="target", assignee="default")
+    config_path = __import__("pathlib").Path(
+        board.execute("PRAGMA database_list").fetchone()[2]
+    ).parent / "config.yaml"
+    config_path.write_text("kanban: [", encoding="utf-8")
+    args = argparse.Namespace(
+        task_id=target, dry_run=True, max=None,
+        failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT, json=False,
+    )
+    assert cli._cmd_dispatch(args) == 2
+    assert "cannot read dispatch configuration" in capsys.readouterr().err
 
 
 def test_targeted_host_cap_refuses_unreadable_other_board(board, tmp_path, monkeypatch):
