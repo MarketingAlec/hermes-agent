@@ -1,0 +1,8 @@
+name: a1_task_dispatch
+version: 0.1.0
+description: "Local source-only prototype for exact Kanban task dispatch."
+author: MarketingAlec
+kind: standalone
+platforms:
+  - linux
+  - macos
