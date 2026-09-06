@@ -11,6 +11,7 @@ from local_prototypes.a1_task_dispatch.testing.harness import (
     install_inert_neighbor,
     install_plugin,
     logical_db_snapshot,
+    make_changed_source_checkout,
     make_fixture,
     run_cli,
     tree_snapshot,
@@ -48,11 +49,13 @@ def test_real_public_cli_discovers_plugin_and_dry_run_is_logically_read_only(tmp
     assert payload["task_id"] == task_id
     assert payload["dry_run"] is True
     assert payload["details"]["eligible"] is True
-    assert set(payload["release_sources"]) == {
+    assert {
         "hermes_cli.kanban",
         "hermes_cli.kanban_db",
         "hermes_constants",
-    }
+        "gateway.lifecycle_ledger",
+        "gateway.memory_status",
+    } <= set(payload["release_sources"])
     assert logical_db_snapshot(fixture.db_path) == before_db
 
     after_tree = tree_snapshot(fixture.hermes_home)
@@ -151,6 +154,34 @@ def test_public_cli_hash_refusal_precedes_board_effects(tmp_path):
 
     assert result.returncode == 2
     assert _payload(result)["error"] == "source hash mismatch: hermes_cli.kanban_db"
+    assert logical_db_snapshot(fixture.db_path) == before_db
+    after_tree = tree_snapshot(fixture.hermes_home)
+    assert "kanban.db.dispatch.lock" not in after_tree
+    assert after_tree["config.yaml"] == before_tree["config.yaml"]
+    assert after_tree["SOUL.md"] == before_tree["SOUL.md"]
+
+
+def test_public_cli_refuses_changed_transitive_source_before_board_effects(tmp_path):
+    fixture = make_fixture(tmp_path)
+    install_plugin(fixture)
+    write_config(fixture)
+    task_id = initialize_board(fixture)
+    changed_source = make_changed_source_checkout(fixture, "gateway/memory_status.py")
+    before_db = logical_db_snapshot(fixture.db_path)
+    before_tree = tree_snapshot(fixture.hermes_home)
+
+    result = run_cli(
+        fixture,
+        "a1-task-dispatch",
+        "--task-id",
+        task_id,
+        "--dry-run",
+        "--json",
+        repo_root=changed_source,
+    )
+
+    assert result.returncode == 2
+    assert _payload(result)["error"] == ("source hash mismatch: gateway.memory_status")
     assert logical_db_snapshot(fixture.db_path) == before_db
     after_tree = tree_snapshot(fixture.hermes_home)
     assert "kanban.db.dispatch.lock" not in after_tree

@@ -53,7 +53,7 @@ def make_fixture(root: Path, *, profile: str = "default") -> Fixture:
     )
 
 
-def isolated_env(fixture: Fixture) -> dict[str, str]:
+def isolated_env(fixture: Fixture, *, repo_root: Path = REPO_ROOT) -> dict[str, str]:
     """Return a minimal credential-free environment for a fixture process."""
     allowed = {
         "PATH",
@@ -70,7 +70,7 @@ def isolated_env(fixture: Fixture) -> dict[str, str]:
         "HOME": str(fixture.home),
         "HERMES_HOME": str(fixture.hermes_root),
         "HERMES_KANBAN_DB": str(fixture.db_path),
-        "PYTHONPATH": str(REPO_ROOT),
+        "PYTHONPATH": str(repo_root),
         "TMPDIR": str(fixture.root / "tmp"),
         "NO_COLOR": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -174,15 +174,44 @@ def initialize_board(fixture: Fixture, *, assignee: str = "default") -> str:
     return marker.partition("=")[2]
 
 
-def run_cli(fixture: Fixture, *args: str) -> subprocess.CompletedProcess[str]:
+def make_changed_source_checkout(fixture: Fixture, relative_path: str) -> Path:
+    """Copy the runtime source and change one module without requiring Git."""
+    destination = fixture.root / "changed-source"
+    runtime_names = {
+        "agent",
+        "cron",
+        "gateway",
+        "hermes_cli",
+        "plugins",
+        "providers",
+        "tools",
+    }
+    destination.mkdir()
+    for source in REPO_ROOT.iterdir():
+        if source.is_file() and source.suffix == ".py":
+            shutil.copy2(source, destination / source.name)
+        elif source.is_dir() and source.name in runtime_names:
+            shutil.copytree(
+                source,
+                destination / source.name,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+    target = destination / relative_path
+    target.write_bytes(target.read_bytes() + b"\n# changed transitive dependency\n")
+    return destination
+
+
+def run_cli(
+    fixture: Fixture, *args: str, repo_root: Path = REPO_ROOT
+) -> subprocess.CompletedProcess[str]:
     command = [sys.executable, "-m", "hermes_cli.main"]
     if fixture.profile != "default":
         command.extend(["--profile", fixture.profile])
     command.extend(args)
     return subprocess.run(
         command,
-        cwd=REPO_ROOT,
-        env=isolated_env(fixture),
+        cwd=repo_root,
+        env=isolated_env(fixture, repo_root=repo_root),
         text=True,
         capture_output=True,
         timeout=60,

@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib
 import json
 import shutil
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 
@@ -41,11 +43,13 @@ def test_compatibility_accepts_the_exact_loaded_release_sources():
 
     assert admission.ok is True
     assert admission.error is None
-    assert set(admission.origins) == {
+    assert {
         "hermes_cli.kanban",
         "hermes_cli.kanban_db",
         "hermes_constants",
-    }
+        "gateway.lifecycle_ledger",
+        "gateway.memory_status",
+    } <= set(admission.origins)
 
 
 def test_compatibility_executes_hash_check_and_rejects_changed_source(tmp_path):
@@ -71,6 +75,59 @@ def test_compatibility_executes_hash_check_and_rejects_changed_source(tmp_path):
     assert admission.ok is False
     assert admission.error == "source hash mismatch: hermes_cli.kanban_db"
     assert sys.modules.get("hermes_cli.kanban_db") is loaded_before
+
+
+def test_compatibility_refuses_an_extended_manifest_split_across_checkouts(tmp_path):
+    compat = importlib.import_module("local_prototypes.a1_task_dispatch.compat")
+    exact = compat.check_compatibility()
+    coherent_root = tmp_path / "release"
+    split_root = tmp_path / "other-release"
+    paths = {}
+    for module_name, source in exact.origins.items():
+        destination = coherent_root / Path(*module_name.split(".")).with_suffix(".py")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        paths[module_name] = destination
+    split_memory_status = split_root / "gateway" / "memory_status.py"
+    split_memory_status.parent.mkdir(parents=True)
+    shutil.copy2(Path("gateway/memory_status.py"), split_memory_status)
+    paths["gateway.memory_status"] = split_memory_status
+
+    admission = compat.check_compatibility(origin_resolver=paths.__getitem__)
+
+    assert admission.ok is False
+    assert admission.error == "source origin mismatch: gateway.memory_status"
+
+
+def test_compatibility_resolution_does_not_import_private_modules():
+    script = """
+import json
+import sys
+before = set(sys.modules)
+from local_prototypes.a1_task_dispatch.compat import check_compatibility
+admission = check_compatibility()
+private_roots = {
+    'agent', 'gateway', 'hermes_cli', 'hermes_constants', 'hermes_state', 'toolsets'
+}
+added = sorted(
+    name for name in set(sys.modules) - before
+    if name.partition('.')[0] in private_roots
+)
+print(json.dumps({'ok': admission.ok, 'added': added}))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["added"] == []
 
 
 def test_compatibility_refuses_unknown_source_without_importing_private_module(
