@@ -18,9 +18,10 @@ them, the command resolves the source files the current Python process would
 actually load without importing those modules or their package parents,
 verifies any already-loaded module has the same origin, requires every pin to
 come from one coherent checkout, and checks these release-29112 SHA-256 pins.
-The manifest contains 130 source files: all 129 release sources observed while
-the 16 fixed adapter/helper seeds initialize in a fresh isolated process, plus
-the conservatively retained `gateway.platform_registry` pin. The observed set
+The manifest contains 136 source files: the 129 release sources observed while
+the 16 fixed adapter/helper seeds initialize, six more first-party sources
+loaded by the ready-claim lifecycle hook, and the conservatively retained
+`gateway.platform_registry` pin. The observed set
 includes 39 release-shipped bundled provider initializers and the helper sources
 they import. `compat.py` is the finite exact pin and path inventory.
 
@@ -28,17 +29,30 @@ The authoritative test/development completeness oracle imports the fixed seeds
 in a fresh subprocess under a disposable, credential-free `HOME` and
 `HERMES_HOME`. An audit hook refuses network and child-process effects, and the
 oracle collects loaded local `.py` origins independently of both the production
-manifest and the AST walker. A separate static utility remains as a conservative
+manifest and the AST walker. A second isolated trace invokes the adapter's
+`kanban_db._fire_kanban_lifecycle_hook("kanban_task_claimed", ...)` entrypoint
+with fixture event data, exercising its real lazy first-party initialization.
+It uses a test-only Python profiling callback to stop at entry to
+`hermes_cli.plugins.invoke_hook`, before general plugin discovery or enabled
+consumer delivery. No board claim or worker launch is needed for this focused
+hook inventory, and no release function is replaced. The resulting 135-source
+inventory must be covered by the manifest, with matching source paths.
+A separate static utility remains as a conservative
 supplement: it walks visible module imports, package parents, executed class
 bodies, and same-module named helpers. That static walk is intentionally not
 described as complete because it cannot follow initialization calls into
 functions imported from other modules.
 
 The release-bundled provider initializers reached by config initialization are
-pinned even though the provider registry discovers them dynamically. User and
-pip extension implementations are excluded by the oracle's empty disposable
-home and opt-in configuration; dynamically invoked hook consumers are also a
-separate runtime boundary.
+pinned even though the provider registry discovers them dynamically. The fixed
+first-party claim-hook chain is also pinned: `hermes_cli.observability`, its
+`relay_shared_metrics`, `shared_metrics`, `shared_metrics_contract`, and
+`shared_metrics_subscriber` modules, and `agent.relay_runtime`. These execute
+through `hermes_cli.lifecycle.invoke_hook` after the durable claim and before
+spawn, so they are part of source admission. External enabled hook consumers
+remain a separate runtime boundary; user and pip extension implementations are
+excluded by the disposable home, opt-in configuration, and plugin delivery
+boundary described above.
 
 Admission also checks the exact effective membership of the two fixed release
 directories that provider discovery scans: bundled
@@ -76,7 +90,8 @@ not release-shipped Hermes source modules and are not hash-pinned. Host startup
 before the fixed seed imports, third-party extension consumers, and the launched
 child's Hermes/provider/model/credential/network behavior are separate runtime
 boundaries. The release-fixed pre-launch helper sources reached by seed
-initialization are pinned, but this prototype still does not prove a real worker
+initialization and the first-party claim hook are pinned, but this prototype
+still does not prove a real worker
 runtime.
 
 ## Lifecycle contract
@@ -118,7 +133,8 @@ non-macOS/Linux interpreters.
 
 The public CLI tests also cover disabled, missing, and malformed plugins; a
 second enabled inert plugin; required/invalid IDs; changed direct,
-cross-module initializer-helper, and bundled-provider compatibility pins;
+cross-module initializer-helper, first-party claim-hook, and bundled-provider
+compatibility pins;
 default and named-profile isolation; and malformed config. Whole-tree and
 logical-database snapshots protect `config.yaml`, `SOUL.md`, permissions, all
 board tables, and pre-existing plugin files. The observed upstream startup

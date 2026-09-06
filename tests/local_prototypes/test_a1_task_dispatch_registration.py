@@ -90,6 +90,25 @@ def test_compatibility_manifest_covers_isolated_runtime_source_inventory(tmp_pat
     assert not mismatched, f"executed release source paths differ: {mismatched}"
 
 
+def test_compatibility_manifest_covers_lazy_claim_hook_runtime_sources(tmp_path):
+    """Release dependencies first loaded by the ready-claim hook must be pinned."""
+    compat = importlib.import_module("local_prototypes.a1_task_dispatch.compat")
+    repo_root = Path(__file__).resolve().parents[2]
+
+    runtime_sources = release_runtime_sources(
+        repo_root, tmp_path / "claim-hook-inventory", include_claim_hook=True
+    )
+
+    missing = set(runtime_sources) - set(compat.EXPECTED_HASHES)
+    mismatched = {
+        module_name: (compat.SOURCE_PATHS.get(module_name), source_path)
+        for module_name, source_path in runtime_sources.items()
+        if compat.SOURCE_PATHS.get(module_name) != source_path
+    }
+    assert not missing, f"claim-hook release sources are unpinned: {sorted(missing)}"
+    assert not mismatched, f"claim-hook source paths differ: {mismatched}"
+
+
 def test_compatibility_executes_hash_check_and_rejects_changed_source(tmp_path):
     """Changing a load-bearing file must make behavioral admission fail."""
     compat = importlib.import_module("local_prototypes.a1_task_dispatch.compat")

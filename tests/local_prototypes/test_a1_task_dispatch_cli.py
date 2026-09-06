@@ -350,6 +350,44 @@ def test_public_cli_refuses_added_release_provider_member_before_dispatch_effect
     assert "kanban.db.dispatch.lock" not in tree_snapshot(fixture.hermes_home)
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "module_name"),
+    [
+        ("hermes_cli/observability/__init__.py", "hermes_cli.observability"),
+        ("agent/relay_runtime.py", "agent.relay_runtime"),
+    ],
+)
+def test_public_cli_refuses_changed_claim_hook_source_before_dispatch_effects(
+    tmp_path, relative_path, module_name
+):
+    fixture = make_fixture(tmp_path)
+    install_plugin(fixture)
+    write_config(fixture)
+    task_id = initialize_board(fixture)
+    changed_source = make_changed_source_checkout(fixture, relative_path)
+    before_db = logical_db_snapshot(fixture.db_path)
+    before_tree = tree_snapshot(fixture.hermes_home)
+
+    # Safe even against the unpinned RED source: no actual worker can launch.
+    result = run_cli(
+        fixture,
+        "a1-task-dispatch",
+        "--task-id",
+        task_id,
+        "--dry-run",
+        "--json",
+        repo_root=changed_source,
+    )
+
+    assert result.returncode == 2
+    assert _payload(result)["error"] == f"source hash mismatch: {module_name}"
+    assert logical_db_snapshot(fixture.db_path) == before_db
+    after_tree = tree_snapshot(fixture.hermes_home)
+    assert "kanban.db.dispatch.lock" not in after_tree
+    assert after_tree["config.yaml"] == before_tree["config.yaml"]
+    assert after_tree["SOUL.md"] == before_tree["SOUL.md"]
+
+
 def test_public_cli_named_profile_visibility_and_profile_local_refusal(tmp_path):
     worker = make_fixture(tmp_path / "worker-fixture", profile="worker")
     install_plugin(worker)

@@ -12,8 +12,8 @@ from typing import Callable, Mapping
 
 
 EXPECTED_HASHES: Mapping[str, str] = {
-    # Release sources reached by isolated seed initialization, plus retained
-    # conservative static pins.
+    # Release sources reached by seed initialization and the fixed first-party
+    # claim hook, plus retained conservative static pins.
     "agent": "99f85bec3844de2bfbd984d64768b22a3a4c5dba01375c6832b292d24e1617e4",
     "agent.auxiliary_client": "de28c68a86491988e8098f9fd021e99c95e866f3782ba48893f561d33f4f24a3",
     "agent.codex_headers": "a0a83440762b8141240521fe30ee41811c162ff4a39906b3c96c0b187a2d9b63",
@@ -36,6 +36,7 @@ EXPECTED_HASHES: Mapping[str, str] = {
     "agent.prompt_cache_boundary": "4ec97a0da939ae17b322602c7eb24b09b1194cfbee41e7c2fcad487cd60f98d6",
     "agent.reasoning_effort": "9296b9f616a296c9111257f07723d1f8050843f5a3d7bc3d3909f3a8a2ac0e0e",
     "agent.redact": "db98c5b9cf5727abbb471b5009d19d3f8230863869cde207d53c5e5d8d4831f0",
+    "agent.relay_runtime": "974612d5aaa539f2abbe616a99182266369ce7a7f2db7b4b3fb81438592c30a2",
     "agent.secret_scope": "51d91d280ef05d59c0c450dbfaecd6f50b314a4ff75614cb23b5288a308c645d",
     "agent.session_activity": "4e48691002d499b6a8ef7927065178ca4bf64fd7beca4ac8e7123e4dd22a8660",
     "agent.skill_commands": "3ff2f67ee417be29e90994742b7d3561de427241093056cc307c6dfafebc7b64",
@@ -75,6 +76,11 @@ EXPECTED_HASHES: Mapping[str, str] = {
     "hermes_cli.middleware": "cae867efa6a5b3c80675f9d7571fb56cea7519a44364bfc9c938c3e5c6f4d5f6",
     "hermes_cli.nous_account": "d13b2f84d7a5564b3c22d85841212e13855ea13b293ee087bc1d91c19e9b0182",
     "hermes_cli.nous_subscription": "8276f2ffb4b220554f77ccfabd89079114ab1183bd2b0c88ce43e153f8cd1fbc",
+    "hermes_cli.observability": "5d8736f56d865fe90993ac2907496f64ae16e218b7104b95f36e810bd5a8207c",
+    "hermes_cli.observability.relay_shared_metrics": "6b0b415dd7eb291a2e46d5b6da4956b4e9d73945cdea4de2d610fa054ad9d691",
+    "hermes_cli.observability.shared_metrics": "1ea2f6d95d80217a4e7c999e203b572c0fc27d16f1fa82fc3304f28748d66389",
+    "hermes_cli.observability.shared_metrics_contract": "27baae9d80697fb795c43f173ceb8bb3dc545602ff1d608a446b210004c87495",
+    "hermes_cli.observability.shared_metrics_subscriber": "90c0fd4ecca7d0f44d30a48dad99b391040e94627464a3c9e7e9d04d03afdbbf",
     "hermes_cli.personality": "520cf5dbcda99247e39fecf520eac897d270e28dd26908a5c1686131a0d5f6b0",
     "hermes_cli.platforms": "a04bd017cacbf9959bba396f94c5e1e9d7df77d88aaef92e858e89b9705d4b5a",
     "hermes_cli.plugin_capabilities": "cafbd3ffb16cb233e48fca599cce1002b7810f5cfe18a4c09d59b1acccf7dd0c",
@@ -151,6 +157,7 @@ SPECIAL_SOURCE_PATHS: Mapping[str, Path] = {
     "agent.transports": Path("agent/transports/__init__.py"),
     "gateway": Path("gateway/__init__.py"),
     "hermes_cli": Path("hermes_cli/__init__.py"),
+    "hermes_cli.observability": Path("hermes_cli/observability/__init__.py"),
     "plugins.model_providers.actual": Path(
         "plugins/model-providers/actual/__init__.py"
     ),
