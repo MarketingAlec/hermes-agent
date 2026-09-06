@@ -189,6 +189,62 @@ def test_public_cli_refuses_changed_transitive_source_before_board_effects(tmp_p
     assert after_tree["SOUL.md"] == before_tree["SOUL.md"]
 
 
+def test_public_cli_refuses_changed_package_initializer_before_dispatch_effects(
+    tmp_path,
+):
+    fixture = make_fixture(tmp_path)
+    install_plugin(fixture)
+    write_config(fixture)
+    task_id = initialize_board(fixture)
+    changed_source = make_changed_source_checkout(fixture, "gateway/__init__.py")
+    before_db = logical_db_snapshot(fixture.db_path)
+
+    result = run_cli(
+        fixture,
+        "a1-task-dispatch",
+        "--task-id",
+        task_id,
+        "--dry-run",
+        "--json",
+        repo_root=changed_source,
+    )
+
+    assert result.returncode == 2
+    assert _payload(result)["error"] == "source hash mismatch: gateway"
+    assert logical_db_snapshot(fixture.db_path) == before_db
+    assert "kanban.db.dispatch.lock" not in tree_snapshot(fixture.hermes_home)
+
+
+def test_public_cli_refuses_changed_second_order_module_before_dispatch_effects(
+    tmp_path,
+):
+    fixture = make_fixture(tmp_path)
+    install_plugin(fixture)
+    write_config(fixture)
+    task_id = initialize_board(fixture)
+    changed_source = make_changed_source_checkout(
+        fixture, "gateway/shutdown_watchdog.py"
+    )
+    before_db = logical_db_snapshot(fixture.db_path)
+
+    result = run_cli(
+        fixture,
+        "a1-task-dispatch",
+        "--task-id",
+        task_id,
+        "--dry-run",
+        "--json",
+        repo_root=changed_source,
+    )
+
+    assert result.returncode == 2
+    assert _payload(result)["error"] == (
+        "source hash mismatch: gateway.shutdown_watchdog"
+    )
+    assert logical_db_snapshot(fixture.db_path) == before_db
+    assert "kanban.db.dispatch.lock" not in tree_snapshot(fixture.hermes_home)
+
+
 def test_public_cli_named_profile_visibility_and_profile_local_refusal(tmp_path):
     worker = make_fixture(tmp_path / "worker-fixture", profile="worker")
     install_plugin(worker)

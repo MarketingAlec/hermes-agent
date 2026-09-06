@@ -10,6 +10,10 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from local_prototypes.a1_task_dispatch.testing.manifest_closure import (
+    release_manifest_closure,
+)
+
 
 class _RecordingContext:
     def __init__(self) -> None:
@@ -52,20 +56,29 @@ def test_compatibility_accepts_the_exact_loaded_release_sources():
     } <= set(admission.origins)
 
 
+def test_compatibility_manifest_covers_release_module_initialization_closure():
+    """Dropping any package/init-time dependency must break this invariant."""
+    compat = importlib.import_module("local_prototypes.a1_task_dispatch.compat")
+    repo_root = Path(__file__).resolve().parents[2]
+
+    expected = release_manifest_closure(repo_root)
+
+    assert dict(compat.SOURCE_PATHS) == expected
+    assert set(compat.EXPECTED_HASHES) == set(expected)
+
+
 def test_compatibility_executes_hash_check_and_rejects_changed_source(tmp_path):
     """Changing a load-bearing file must make behavioral admission fail."""
     compat = importlib.import_module("local_prototypes.a1_task_dispatch.compat")
     loaded_before = sys.modules.get("hermes_cli.kanban_db")
     exact = compat.check_compatibility()
     root = tmp_path / "release"
-    (root / "hermes_cli").mkdir(parents=True)
-    paths = {
-        "hermes_cli.kanban": root / "hermes_cli" / "kanban.py",
-        "hermes_cli.kanban_db": root / "hermes_cli" / "kanban_db.py",
-        "hermes_constants": root / "hermes_constants.py",
-    }
-    for module_name, destination in paths.items():
-        shutil.copy2(exact.origins[module_name], destination)
+    paths = {}
+    for module_name, source in exact.origins.items():
+        destination = root / compat.SOURCE_PATHS[module_name]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        paths[module_name] = destination
     paths["hermes_cli.kanban_db"].write_bytes(
         paths["hermes_cli.kanban_db"].read_bytes() + b"\n# changed\n"
     )
@@ -84,7 +97,7 @@ def test_compatibility_refuses_an_extended_manifest_split_across_checkouts(tmp_p
     split_root = tmp_path / "other-release"
     paths = {}
     for module_name, source in exact.origins.items():
-        destination = coherent_root / Path(*module_name.split(".")).with_suffix(".py")
+        destination = coherent_root / compat.SOURCE_PATHS[module_name]
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
         paths[module_name] = destination
@@ -134,10 +147,15 @@ def test_compatibility_refuses_unknown_source_without_importing_private_module(
     tmp_path,
 ):
     compat = importlib.import_module("local_prototypes.a1_task_dispatch.compat")
+    exact = compat.check_compatibility()
     missing = tmp_path / "unknown-release" / "kanban.py"
     sys.modules.pop("hermes_cli.kanban", None)
 
-    admission = compat.check_compatibility(origin_resolver=lambda _name: missing)
+    admission = compat.check_compatibility(
+        origin_resolver=lambda name: (
+            missing if name == "hermes_cli.kanban" else exact.origins[name]
+        )
+    )
 
     assert admission.ok is False
     assert admission.error is not None
