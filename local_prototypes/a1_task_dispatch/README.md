@@ -16,22 +16,36 @@ edits. It registers no model tool, hook, schedule, queue, or background task.
 The adapter deliberately uses unsupported private Hermes APIs. Before importing
 them, the command resolves the source files the current Python process would
 actually load without importing those modules or their package parents,
-verifies any already-loaded module has the same origin, requires the complete
-manifest to come from one coherent checkout, and checks these release-29112
-SHA-256 pins. The manifest contains 79 source files: the original 16
-adapter/helper seeds, the explicit `agent`, `gateway`, `hermes_cli`,
-`providers`, and `tools` package initializers, and their finite local
-module-initialization import closure. `compat.py` is the exact pin inventory.
+verifies any already-loaded module has the same origin, requires every pin to
+come from one coherent checkout, and checks these release-29112 SHA-256 pins.
+The manifest contains 130 source files: all 129 release sources observed while
+the 16 fixed adapter/helper seeds initialize in a fresh isolated process, plus
+the conservatively retained `gateway.platform_registry` pin. The observed set
+includes 39 release-shipped bundled provider initializers and the helper sources
+they import. `compat.py` is the finite exact pin and path inventory.
 
-An independent test/build utility recomputes that closure from the 16 seeds.
-It includes package parents, imports in module-level conditional and `try`
-blocks, executed class bodies, and imports inside same-module named helpers
-called during initialization. It does not descend into otherwise deferred
-function or method bodies, which would incorrectly treat the launched child's
-worker/model runtime as part of the importing process. The eager config
-initializer's import of the provider registry is included; implementations
-that the registry discovers dynamically remain host-selected extension code,
-like dynamically discovered hook consumers, rather than release module pins.
+The authoritative test/development completeness oracle imports the fixed seeds
+in a fresh subprocess under a disposable, credential-free `HOME` and
+`HERMES_HOME`. An audit hook refuses network and child-process effects, and the
+oracle collects loaded local `.py` origins independently of both the production
+manifest and the AST walker. A separate static utility remains as a conservative
+supplement: it walks visible module imports, package parents, executed class
+bodies, and same-module named helpers. That static walk is intentionally not
+described as complete because it cannot follow initialization calls into
+functions imported from other modules.
+
+The release-bundled provider initializers reached by config initialization are
+pinned even though the provider registry discovers them dynamically. User and
+pip extension implementations are excluded by the oracle's empty disposable
+home and opt-in configuration; dynamically invoked hook consumers are also a
+separate runtime boundary.
+
+Admission also checks the exact effective membership of the two fixed release
+directories that provider discovery scans: bundled
+`plugins/model-providers/<name>/__init__.py` sources and legacy `providers`
+modules other than private names and `base`. An added discoverable release
+member refuses even when every previously pinned file is unchanged. This check
+does not enumerate user-home providers or pip entry points.
 
 The manifest follows the actual helper path: Kanban import-time support;
 delegated-child and SQLite file-integrity checks around the claim transaction;
@@ -56,12 +70,14 @@ imports and dispatch effects. It is not a sandbox and does not protect against
 arbitrary malicious code already running in the process.
 
 The source boundary ends at the native `subprocess.Popen` worker-launch call.
-Python standard-library behavior, OS-provided measurements and lock/filesystem
-semantics, and the public PyYAML package are not Hermes source modules and are
-not hash-pinned. Dynamically discovered extension consumers and the launched
+Python standard-library behavior, installed external dependencies, OS-provided
+measurements and lock/filesystem semantics, and the public PyYAML package are
+not release-shipped Hermes source modules and are not hash-pinned. Host startup
+before the fixed seed imports, third-party extension consumers, and the launched
 child's Hermes/provider/model/credential/network behavior are separate runtime
-boundaries. The release-fixed pre-launch helper sources the adapter requires
-are pinned, but this prototype still does not prove a real worker runtime.
+boundaries. The release-fixed pre-launch helper sources reached by seed
+initialization are pinned, but this prototype still does not prove a real worker
+runtime.
 
 ## Lifecycle contract
 
@@ -101,7 +117,8 @@ variables, creates a native temporary SQLite board, and invokes the full public
 non-macOS/Linux interpreters.
 
 The public CLI tests also cover disabled, missing, and malformed plugins; a
-second enabled inert plugin; required/invalid IDs; changed compatibility pins;
+second enabled inert plugin; required/invalid IDs; changed direct,
+cross-module initializer-helper, and bundled-provider compatibility pins;
 default and named-profile isolation; and malformed config. Whole-tree and
 logical-database snapshots protect `config.yaml`, `SOUL.md`, permissions, all
 board tables, and pre-existing plugin files. The observed upstream startup

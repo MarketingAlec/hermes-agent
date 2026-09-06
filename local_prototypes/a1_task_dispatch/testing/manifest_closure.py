@@ -1,8 +1,9 @@
-"""Independent release-source closure calculation for prototype tests.
+"""Conservative static release-import inventory for prototype tests.
 
 This module is test/build tooling, not part of plugin admission.  It derives
-the source files Python can execute while importing the release-fixed seed
-modules without importing those modules itself.
+local imports visible to an AST walk of the release-fixed seed modules without
+importing those modules itself.  It supplements, but does not replace, the
+independent isolated runtime inventory.
 """
 
 from __future__ import annotations
@@ -100,9 +101,10 @@ class _ExecutedCodeVisitor(ast.NodeVisitor):
         self._visit_function_definition(node)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
-        # Its defaults are represented on the containing Call/assignment;
-        # the lambda body itself is deferred.
-        return
+        # Defaults execute when the lambda is created; its body is deferred.
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
 
     def _visit_function_definition(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
@@ -163,7 +165,7 @@ def _module_imports(root: Path, module_name: str, source: Path) -> set[str]:
 
 
 def release_manifest_closure(root: Path) -> dict[str, Path]:
-    """Return the finite module-initialization source closure of the seeds."""
+    """Return the conservative static import closure of the fixed seeds."""
     root = root.resolve()
     pending = deque(sorted(RELEASE_SEED_MODULES))
     sources: dict[str, Path] = {}

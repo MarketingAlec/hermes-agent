@@ -174,8 +174,8 @@ def initialize_board(fixture: Fixture, *, assignee: str = "default") -> str:
     return marker.partition("=")[2]
 
 
-def make_changed_source_checkout(fixture: Fixture, relative_path: str) -> Path:
-    """Copy the runtime source and change one module without requiring Git."""
+def copy_runtime_source_checkout(fixture: Fixture) -> Path:
+    """Copy the runtime source without requiring Git metadata."""
     destination = fixture.root / "changed-source"
     runtime_names = {
         "agent",
@@ -196,6 +196,12 @@ def make_changed_source_checkout(fixture: Fixture, relative_path: str) -> Path:
                 destination / source.name,
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
             )
+    return destination
+
+
+def make_changed_source_checkout(fixture: Fixture, relative_path: str) -> Path:
+    """Copy the runtime source and change one module without requiring Git."""
+    destination = copy_runtime_source_checkout(fixture)
     target = destination / relative_path
     target.write_bytes(target.read_bytes() + b"\n# changed transitive dependency\n")
     return destination

@@ -7,6 +7,7 @@ import json
 import pytest
 
 from local_prototypes.a1_task_dispatch.testing.harness import (
+    copy_runtime_source_checkout,
     initialize_board,
     install_inert_neighbor,
     install_plugin,
@@ -241,6 +242,110 @@ def test_public_cli_refuses_changed_second_order_module_before_dispatch_effects(
     assert _payload(result)["error"] == (
         "source hash mismatch: gateway.shutdown_watchdog"
     )
+    assert logical_db_snapshot(fixture.db_path) == before_db
+    assert "kanban.db.dispatch.lock" not in tree_snapshot(fixture.hermes_home)
+
+
+def test_public_cli_refuses_changed_cross_module_init_helper_before_dispatch_effects(
+    tmp_path,
+):
+    fixture = make_fixture(tmp_path)
+    install_plugin(fixture)
+    write_config(fixture)
+    task_id = initialize_board(fixture)
+    changed_source = make_changed_source_checkout(
+        fixture, "hermes_cli/managed_scope.py"
+    )
+    before_db = logical_db_snapshot(fixture.db_path)
+
+    result = run_cli(
+        fixture,
+        "a1-task-dispatch",
+        "--task-id",
+        task_id,
+        "--dry-run",
+        "--json",
+        repo_root=changed_source,
+    )
+
+    assert result.returncode == 2
+    assert _payload(result)["error"] == (
+        "source hash mismatch: hermes_cli.managed_scope"
+    )
+    assert logical_db_snapshot(fixture.db_path) == before_db
+    assert "kanban.db.dispatch.lock" not in tree_snapshot(fixture.hermes_home)
+
+
+def test_public_cli_refuses_changed_bundled_provider_before_dispatch_effects(
+    tmp_path,
+):
+    fixture = make_fixture(tmp_path)
+    install_plugin(fixture)
+    write_config(fixture)
+    task_id = initialize_board(fixture)
+    changed_source = make_changed_source_checkout(
+        fixture, "plugins/model-providers/openai-codex/__init__.py"
+    )
+    before_db = logical_db_snapshot(fixture.db_path)
+
+    result = run_cli(
+        fixture,
+        "a1-task-dispatch",
+        "--task-id",
+        task_id,
+        "--dry-run",
+        "--json",
+        repo_root=changed_source,
+    )
+
+    assert result.returncode == 2
+    assert _payload(result)["error"] == (
+        "source hash mismatch: plugins.model_providers.openai_codex"
+    )
+    assert logical_db_snapshot(fixture.db_path) == before_db
+    assert "kanban.db.dispatch.lock" not in tree_snapshot(fixture.hermes_home)
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_error"),
+    [
+        (
+            "plugins/model-providers/added-member/__init__.py",
+            "bundled provider source membership mismatch",
+        ),
+        (
+            "providers/added_member.py",
+            "legacy provider module membership mismatch",
+        ),
+    ],
+)
+def test_public_cli_refuses_added_release_provider_member_before_dispatch_effects(
+    tmp_path,
+    relative_path,
+    expected_error,
+):
+    fixture = make_fixture(tmp_path)
+    install_plugin(fixture)
+    write_config(fixture)
+    task_id = initialize_board(fixture)
+    changed_source = copy_runtime_source_checkout(fixture)
+    added_provider = changed_source / relative_path
+    added_provider.parent.mkdir(parents=True, exist_ok=True)
+    added_provider.write_text("DISCOVERED_TEST_PROVIDER = True\n", encoding="utf-8")
+    before_db = logical_db_snapshot(fixture.db_path)
+
+    result = run_cli(
+        fixture,
+        "a1-task-dispatch",
+        "--task-id",
+        task_id,
+        "--dry-run",
+        "--json",
+        repo_root=changed_source,
+    )
+
+    assert result.returncode == 2
+    assert _payload(result)["error"] == expected_error
     assert logical_db_snapshot(fixture.db_path) == before_db
     assert "kanban.db.dispatch.lock" not in tree_snapshot(fixture.hermes_home)
 

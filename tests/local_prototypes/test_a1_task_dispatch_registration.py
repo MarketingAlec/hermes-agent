@@ -13,6 +13,9 @@ from types import SimpleNamespace
 from local_prototypes.a1_task_dispatch.testing.manifest_closure import (
     release_manifest_closure,
 )
+from local_prototypes.a1_task_dispatch.testing.runtime_manifest import (
+    release_runtime_sources,
+)
 
 
 class _RecordingContext:
@@ -56,15 +59,35 @@ def test_compatibility_accepts_the_exact_loaded_release_sources():
     } <= set(admission.origins)
 
 
-def test_compatibility_manifest_covers_release_module_initialization_closure():
-    """Dropping any package/init-time dependency must break this invariant."""
+def test_compatibility_manifest_covers_static_release_import_closure():
+    """Every conservatively walked import-time source remains pinned."""
     compat = importlib.import_module("local_prototypes.a1_task_dispatch.compat")
     repo_root = Path(__file__).resolve().parents[2]
 
-    expected = release_manifest_closure(repo_root)
+    static_sources = release_manifest_closure(repo_root)
 
-    assert dict(compat.SOURCE_PATHS) == expected
-    assert set(compat.EXPECTED_HASHES) == set(expected)
+    assert not (set(static_sources) - set(compat.EXPECTED_HASHES))
+    assert all(
+        compat.SOURCE_PATHS[module_name] == source_path
+        for module_name, source_path in static_sources.items()
+    )
+
+
+def test_compatibility_manifest_covers_isolated_runtime_source_inventory(tmp_path):
+    """Any release source executed by fixed-seed initialization must be pinned."""
+    compat = importlib.import_module("local_prototypes.a1_task_dispatch.compat")
+    repo_root = Path(__file__).resolve().parents[2]
+
+    runtime_sources = release_runtime_sources(repo_root, tmp_path / "runtime-inventory")
+
+    missing = set(runtime_sources) - set(compat.EXPECTED_HASHES)
+    mismatched = {
+        module_name: (compat.SOURCE_PATHS.get(module_name), source_path)
+        for module_name, source_path in runtime_sources.items()
+        if compat.SOURCE_PATHS.get(module_name) != source_path
+    }
+    assert not missing, f"executed release sources are unpinned: {sorted(missing)}"
+    assert not mismatched, f"executed release source paths differ: {mismatched}"
 
 
 def test_compatibility_executes_hash_check_and_rejects_changed_source(tmp_path):
