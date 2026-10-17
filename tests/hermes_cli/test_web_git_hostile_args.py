@@ -4,6 +4,7 @@ Each hostile value names an executable that records it ran, so a file in the sin
 means git parsed request text as an option instead of a revision or a path.
 """
 
+import itertools
 import os
 import re
 import shutil
@@ -180,6 +181,14 @@ def test_untracked_diff_fallback_stays_inside_the_repo(client, clone):
     assert "+brand new" in client.get("/api/git/review/diff", params={"path": str(clone), "file": "new.txt"}).json()["diff"]
     for file in ("new.txt", str(clone / "new.txt")):
         assert "+brand new" in client.get("/api/git/file-diff", params={"path": str(clone), "file": file}).json()["diff"]
+
+
+def test_sanitize_branch_never_returns_an_option_shaped_name():
+    edge = ["-", ".", "/", " ", "\t", "=", "~", "a"]
+    inputs = ["".join(chars) for n in range(1, 6) for chars in itertools.product(edge, repeat=n)]
+    inputs += ["--upload-pack=touch /tmp/x", "-c core.pager=touch /tmp/x", " \t--x", "日本-", "\u00a0-x"]
+    for raw in inputs:
+        assert not web_git._sanitize_branch(raw).startswith("-"), repr(raw)
 
 
 def test_git_version_problem_refuses_git_older_than_2_30():

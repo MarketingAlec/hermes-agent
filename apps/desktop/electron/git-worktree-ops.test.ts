@@ -593,6 +593,31 @@ test('fetchRemoteBranch: option-shaped remote and branch names never reach git a
   }
 })
 
+// Every string over an alphabet of the characters that matter at a name's edge.
+function* edgeStrings(alphabet, maxLength) {
+  let level = ['']
+
+  for (let length = 1; length <= maxLength; length++) {
+    level = level.flatMap(prefix => alphabet.map(char => prefix + char))
+    yield* level
+  }
+}
+
+test('sanitizeBranch: never returns an option-shaped name', () => {
+  const inputs = [
+    ...edgeStrings(['-', '.', '/', ' ', '\t', '=', '~', 'a'], 5),
+    '--upload-pack=touch /tmp/x',
+    '-c core.pager=touch /tmp/x',
+    ' \t--x',
+    '日本-',
+    '\u00a0-x'
+  ]
+
+  for (const input of inputs) {
+    assert.equal(sanitizeBranch(input).startsWith('-'), false, JSON.stringify(input))
+  }
+})
+
 test('gitVersionProblem: git older than 2.30 is refused with the reason', () => {
   for (const version of ['git version 2.23.0', 'git version 2.24.4', 'git version 2.29.3', 'git version 1.9']) {
     assert.match(gitVersionProblem(version), /too old.*Git 2\.30\.0 or newer/, version)

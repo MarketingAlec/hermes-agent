@@ -2,6 +2,7 @@
 // fresh worktree the lightest way (`git worktree add -b`), list real worktrees,
 // and remove them. Git is the source of truth; the renderer just drives these.
 
+import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -91,13 +92,18 @@ async function listWorktrees(repoPath, gitBin) {
 // or "" when nothing usable remains. Mirrors the renderer's `gitRef`, so a bad
 // value can't reach `git` no matter the caller (the GUI also enforces live).
 function sanitizeBranch(name) {
-  return String(name || '')
+  const branch = String(name || '')
     .replace(/\s+/g, '-')
     .replace(/[^\w./-]/g, '')
     .replace(/-{2,}/g, '-')
     .replace(/\/{2,}/g, '/')
     .replace(/\.{2,}/g, '.')
     .replace(/^[-./]+|[-./]+$/g, '')
+
+  // Callers put the result in argv unguarded (`-b <branch>`, `switch <branch>`).
+  assert(!branch.startsWith('-'), 'sanitizeBranch produced an option-shaped branch name')
+
+  return branch
 }
 
 function slugify(name) {
