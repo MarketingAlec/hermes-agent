@@ -117,6 +117,10 @@ For sessions running inside a Git repository, the app has a built-in source-cont
 - **Review pane** — **Cmd/Ctrl+G** toggles the working-tree review pane: branch and ahead/behind status, changed files (list or tree view), and diffs scoped to **Uncommitted**, **Branch**, or **Last turn** (just what the agent changed in its most recent turn). Stage/unstage files, revert changes, write a commit message (or **Generate commit message**), then **Commit** or **Commit & Push** — and **Create PR** via the GitHub CLI (`gh`), or hand the whole thing to the agent with **Ask Hermes to open PR**. You can also create and switch branches from here.
 - **Worktrees** — **Cmd/Ctrl+Shift+B** (or **New worktree** on a project in the sidebar) creates a Git worktree on a new branch so an agent can work on a parallel copy of the repo without touching your checkout. Worktrees show up as their own lanes under the project; removing one offers to delete the worktree directory (the branch stays) or just hide the lane and leave it on disk, with a force option when it has uncommitted changes.
 
+:::note Minimum Git version
+Creating a worktree needs **Git 2.30 or newer**, on the machine that runs the session (your computer, or the remote gateway). Hermes passes branch names and base refs to Git behind `--end-of-options`, so a name can never be read as a Git option. Git's option parser learned that in 2.24, but `git rev-parse` only in 2.30. With an older Git, **New worktree** and **convert a branch** stop with an error that names your Git version; nothing is created. Check with `git --version`.
+:::
+
 ### Memory Graph
 
 The **Memory Graph** (command palette → *Memory Graph*, or the status-bar item) is an interactive map of what Hermes has learned for you — skills and memories laid out as a zoomable node graph with a timeline, filterable by **All / Used / Learned**. A share control exports the map layout as a compact code you can paste to someone else (layout only — none of your memory or skill text is included) and imports codes the same way.

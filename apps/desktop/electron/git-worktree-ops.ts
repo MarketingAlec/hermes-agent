@@ -2,6 +2,7 @@
 // fresh worktree the lightest way (`git worktree add -b`), list real worktrees,
 // and remove them. Git is the source of truth; the renderer just drives these.
 
+import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -91,13 +92,18 @@ async function listWorktrees(repoPath, gitBin) {
 // or "" when nothing usable remains. Mirrors the renderer's `gitRef`, so a bad
 // value can't reach `git` no matter the caller (the GUI also enforces live).
 function sanitizeBranch(name) {
-  return String(name || '')
+  const branch = String(name || '')
     .replace(/\s+/g, '-')
     .replace(/[^\w./-]/g, '')
     .replace(/-{2,}/g, '-')
     .replace(/\/{2,}/g, '/')
     .replace(/\.{2,}/g, '.')
     .replace(/^[-./]+|[-./]+$/g, '')
+
+  // Callers put the result in argv unguarded (`-b <branch>`, `switch <branch>`).
+  assert(!branch.startsWith('-'), 'sanitizeBranch produced an option-shaped branch name')
+
+  return branch
 }
 
 function slugify(name) {
@@ -133,6 +139,90 @@ async function gitOk(gitBin, args, cwd) {
   } catch {
     return false
   }
+}
+
+// Refs and remote names arrive from the renderer and land in positional argv
+// slots, where git parses an option-shaped value as a flag (`git fetch origin
+// --upload-pack=<cmd>` runs the command). Fail closed and hand git only values
+// that it cannot read as options.
+const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+
+const optionShaped = value => typeof value !== 'string' || !value || value.startsWith('-')
+
+// The full sha of the commit that `ref` names, or "".
+async function verifiedCommitSha(gitBin, cwd, ref) {
+  if (optionShaped(ref)) {
+    return ''
+  }
+
+  const sha = await gitLine(gitBin, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{commit}`], cwd)
+
+  return SHA_RE.test(sha) ? sha : ''
+}
+
+// Git's option parser learned `--end-of-options` in 2.24, and `git rev-parse`
+// (which resolves a base to its sha) only in 2.30. On an older git every
+// guarded call fails, so the worktree flow refuses up front with the reason.
+const MIN_GIT_VERSION = [2, 30, 0]
+
+// Why this git cannot run the worktree flow, or "" when it can. An unreadable
+// version string is left for git itself to judge.
+function gitVersionProblem(versionOutput) {
+  const match = /git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(String(versionOutput || ''))
+
+  if (!match) {
+    return ''
+  }
+
+  const found = match.slice(1).map(part => Number(part || 0))
+  const index = found.findIndex((part, i) => part !== MIN_GIT_VERSION[i])
+
+  if (index === -1 || found[index] > MIN_GIT_VERSION[index]) {
+    return ''
+  }
+
+  return (
+    `Git ${found.join('.')} is too old. Hermes needs Git ${MIN_GIT_VERSION.join('.')} or newer ` +
+    'to create worktrees. Update Git, then try again.'
+  )
+}
+
+// Only a passing check is cached, so updating git takes effect without a restart.
+const supportedGitBins = new Set()
+
+async function requireSupportedGit(gitBin, cwd) {
+  if (supportedGitBins.has(gitBin)) {
+    return
+  }
+
+  const version = await gitLine(gitBin, ['--version'], cwd)
+  const problem = gitVersionProblem(version)
+
+  if (problem) {
+    throw new Error(problem)
+  }
+
+  if (version) {
+    supportedGitBins.add(gitBin)
+  }
+}
+
+// Best-effort `git fetch <remote> <branch>`. False, without running fetch,
+// unless `remote` is a configured remote and `branch` a valid branch name.
+async function fetchRemoteBranch(gitBin, cwd, remote, branch) {
+  if (optionShaped(remote) || optionShaped(branch)) {
+    return false
+  }
+
+  if (!(await gitOk(gitBin, ['check-ref-format', `refs/heads/${branch}`], cwd))) {
+    return false
+  }
+
+  if (!(await gitLine(gitBin, ['remote'], cwd)).split('\n').includes(remote)) {
+    return false
+  }
+
+  return gitOk(gitBin, ['fetch', '--end-of-options', remote, branch], cwd)
 }
 
 // The remote that a ref belongs to ("origin" for "origin/main"), or "" when the
@@ -256,6 +346,10 @@ async function addExistingBranchWorktree(gitBin, root, name) {
   const remote = await remoteOfRef(gitBin, root, requested)
   const branch = remote ? requested.slice(remote.length + 1) : requested
 
+  if (optionShaped(branch)) {
+    throw new Error('Branch name is required.')
+  }
+
   if (!remote && branch === (await defaultBranch(gitBin, root))) {
     await runGit(gitBin, ['switch', branch], root)
 
@@ -267,26 +361,22 @@ async function addExistingBranchWorktree(gitBin, root, name) {
   if (remote) {
     // The remote-tracking ref is stale if the user did not fetch recently. This
     // fetch is best effort: after a failure, the last known ref is still there
-    // to branch from.
-    try {
-      await runGit(gitBin, ['fetch', remote, branch], root)
-    } catch {
-      // The user is offline, or the branch is gone from the remote. Use the ref
-      // that the repo already has.
-    }
-
-    await runGit(gitBin, ['worktree', 'add', '--track', '-b', branch, dir, requested], root)
+    // to branch from. A false result means the user is offline, or the branch
+    // is gone from the remote. Use the ref that the repo already has.
+    await fetchRemoteBranch(gitBin, root, remote, branch)
+    await runGit(gitBin, ['worktree', 'add', '--track', '-b', branch, '--end-of-options', dir, requested], root)
 
     return { path: dir, branch, repoRoot: root }
   }
 
-  await runGit(gitBin, ['worktree', 'add', dir, branch], root)
+  await runGit(gitBin, ['worktree', 'add', '--end-of-options', dir, branch], root)
 
   return { path: dir, branch, repoRoot: root }
 }
 
 async function addWorktree(repoPath, options, gitBin) {
   const resolved = resolveRequestedPathForIpc(repoPath, { purpose: 'Worktree add' })
+  await requireSupportedGit(gitBin, resolved)
   // A new project's folder may not be a git repo yet — init it (with a root
   // commit) so the worktree has something to branch from.
   await ensureGitRepo(gitBin, resolved)
@@ -301,7 +391,8 @@ async function addWorktree(repoPath, options, gitBin) {
   const branch = sanitizeBranch(opts.branch) || `hermes/${slug}`
   const dir = uniqueDir(path.join(root, '.worktrees', slug))
 
-  const args = ['worktree', 'add', '-b', branch, dir]
+  const flags = []
+  const start = []
 
   if (opts.base) {
     // Remote-tracking branches may be stale or missing if the user hasn't
@@ -311,34 +402,34 @@ async function addWorktree(repoPath, options, gitBin) {
     const base = String(opts.base)
 
     if (base.startsWith('origin/')) {
-      const remoteBranch = base.slice('origin/'.length)
-
-      try {
-        await runGit(gitBin, ['fetch', 'origin', remoteBranch], root)
-      } catch {
-        // The fetch isn't mandatory, but it would be nice to do if possible.
-        // If it's not possible, just use the local ref of the remote branch.
-        // If it doesn't exist locally, we'll get an error
-      }
+      // The fetch isn't mandatory, but it would be nice to do if possible.
+      // If it's not possible, just use the local ref of the remote branch.
+      await fetchRemoteBranch(gitBin, root, 'origin', base.slice('origin/'.length))
 
       // When branching off a remote-tracking ref, git auto-sets up tracking
       // (e.g. `new-branch` → tracks `origin/main`). The user almost certainly
       // wants a standalone local branch — like `git checkout origin/main &&
       // git checkout -b new-branch` — not a branch silently wired to the
       // remote's upstream. `--no-track` prevents that.
-      args.push('--no-track')
+      flags.push('--no-track')
     }
 
-    args.push(base)
+    const sha = await verifiedCommitSha(gitBin, root, base)
+
+    if (!sha) {
+      throw new Error(`Base "${base}" is not a commit in this repository.`)
+    }
+
+    start.push(sha)
   }
 
   try {
-    await runGit(gitBin, args, root)
+    await runGit(gitBin, ['worktree', 'add', ...flags, '-b', branch, '--end-of-options', dir, ...start], root)
   } catch (err) {
     // Branch name may already exist — retry checking out the existing branch
     // into a fresh worktree dir instead of failing the whole flow.
     if (/already exists/i.test(err.stderr || '')) {
-      await runGit(gitBin, ['worktree', 'add', dir, branch], root)
+      await runGit(gitBin, ['worktree', 'add', '--end-of-options', dir, branch], root)
     } else {
       throw err
     }
@@ -527,6 +618,8 @@ async function listBaseBranches(repoPath, gitBin) {
 export {
   addWorktree,
   ensureGitRepo,
+  fetchRemoteBranch,
+  gitVersionProblem,
   listBaseBranches,
   listBranches,
   listWorktrees,

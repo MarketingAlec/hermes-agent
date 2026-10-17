@@ -382,13 +382,67 @@ async function reviewDiff(repoPath, filePath, scope, baseRef, staged, gitBin) {
     return worktree
   }
 
-  // Untracked file: no worktree diff exists, so synthesize an all-add diff via
-  // --no-index (exits non-zero by design when files differ, so go around
-  // simple-git's reject-on-nonzero with a raw execFile).
+  // Untracked file: no worktree diff exists.
+  return untrackedAllAddDiff(git, cwd, filePath, gitBin)
+}
+
+// `--no-index` reads any file on disk, so the untracked fallback takes only a
+// relative path, with no `..`, that resolves (symlinks included) to a file
+// inside the repo's work tree and outside `.git`.
+async function containedPath(git, cwd, filePath) {
+  if (typeof filePath !== 'string' || !filePath || filePath.includes('\0')) {
+    return null
+  }
+
+  if (path.isAbsolute(filePath) || path.win32.isAbsolute(filePath) || filePath.split(/[\\/]/).includes('..')) {
+    return null
+  }
+
+  try {
+    const root = await fs.realpath((await git.raw(['rev-parse', '--show-toplevel'])).trim())
+    const rel = path.relative(root, await fs.realpath(path.resolve(cwd, filePath)))
+    const parts = rel.split(path.sep)
+
+    if (!rel || path.isAbsolute(rel) || parts[0] === '..' || parts.some(part => part.toLowerCase() === '.git')) {
+      return null
+    }
+
+    return filePath
+  } catch {
+    return null
+  }
+}
+
+// The file preview names files by absolute path. Only the parent is resolved,
+// so a symlink named by the caller stays a symlink.
+async function cwdRelativePath(cwd, filePath) {
+  if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) {
+    return filePath
+  }
+
+  try {
+    const [base, parent] = await Promise.all([fs.realpath(cwd), fs.realpath(path.dirname(filePath))])
+
+    return path.relative(base, path.join(parent, path.basename(filePath)))
+  } catch {
+    return null
+  }
+}
+
+// Synthesize an all-add diff via --no-index (exits non-zero by design when
+// files differ, so go around simple-git's reject-on-nonzero with a raw
+// execFile).
+async function untrackedAllAddDiff(git, cwd, filePath, gitBin): Promise<string> {
+  const contained = await containedPath(git, cwd, filePath)
+
+  if (!contained) {
+    return ''
+  }
+
   return new Promise(resolve => {
     execFile(
       gitBin || 'git',
-      ['diff', '--no-index', '--', '/dev/null', filePath],
+      ['diff', '--no-index', '--', '/dev/null', contained],
       { cwd, windowsHide: true, timeout: 30_000, maxBuffer: 32 * 1024 * 1024 },
       (_err, stdout) => resolve(String(stdout || ''))
     )
@@ -423,14 +477,7 @@ async function fileDiffVsHead(repoPath, filePath, gitBin) {
     return ''
   }
 
-  return new Promise(resolve => {
-    execFile(
-      gitBin || 'git',
-      ['diff', '--no-index', '--', '/dev/null', filePath],
-      { cwd, windowsHide: true, timeout: 30_000, maxBuffer: 32 * 1024 * 1024 },
-      (_err, stdout) => resolve(String(stdout || ''))
-    )
-  })
+  return untrackedAllAddDiff(git, cwd, await cwdRelativePath(cwd, filePath), gitBin)
 }
 
 async function reviewStage(repoPath, filePath, gitBin) {

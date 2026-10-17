@@ -9,6 +9,8 @@ import { test } from 'vitest'
 import {
   addWorktree,
   ensureGitRepo,
+  fetchRemoteBranch,
+  gitVersionProblem,
   listBaseBranches,
   listBranches,
   parseWorktrees,
@@ -468,5 +470,195 @@ test('switchBranch: repo dir still validates the branch name and switches', asyn
     assert.deepEqual(result, { branch: 'main' })
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// An executable that records that it ran. Every hostile value below names it,
+// so anything besides the payload in `sink` means git parsed caller text as an
+// option and executed it.
+function makeSink(label) {
+  const sink = fs.mkdtempSync(path.join(os.tmpdir(), `hermes-${label}-sink-`))
+  const payload = path.join(sink, 'payload')
+
+  fs.writeFileSync(payload, `#!/bin/sh\ntouch "${path.join(sink, 'ran')}"\n`, { mode: 0o755 })
+
+  return { executed: () => fs.readdirSync(sink).filter(name => name !== 'payload'), payload, sink }
+}
+
+function hostileValues(payload) {
+  return [
+    `--upload-pack=${payload}`,
+    `-c core.pager=${payload}`,
+    `-ccore.pager=${payload}`,
+    `--output=${payload}.out`,
+    '-'
+  ]
+}
+
+test('addWorktree: option-shaped bases are rejected without running anything', async () => {
+  const { cloneDir, remoteDir } = seedRemoteAndClone('hostile-base', [])
+  const { executed, payload, sink } = makeSink('hostile-base')
+
+  try {
+    // The sink is live: the same payload handed to git as an option does run.
+    try {
+      execFileSync('git', ['fetch', 'origin', `--upload-pack=${payload}`], { cwd: cloneDir, stdio: 'ignore' })
+    } catch {
+      // upload-pack is not a real server; only the side effect matters.
+    }
+
+    assert.deepEqual(executed(), ['ran'])
+    fs.rmSync(path.join(sink, 'ran'))
+
+    const bases = hostileValues(payload).flatMap(value => [value, `origin/${value}`])
+
+    for (const base of bases) {
+      await assert.rejects(addWorktree(cloneDir, { base, branch: 'hostile' }, 'git'), undefined, base)
+    }
+
+    assert.deepEqual(executed(), [])
+    assert.equal(
+      execFileSync('git', ['branch', '--list', 'hostile'], { cwd: cloneDir }).toString().trim(),
+      '',
+      'no branch was created from a hostile base'
+    )
+  } finally {
+    for (const dir of [remoteDir, cloneDir, sink]) {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('addWorktree: a base names a commit, and the worktree starts at that commit', async () => {
+  const { cloneDir, remoteDir } = seedRemoteAndClone('base-commit', [])
+
+  const git = (...args) =>
+    execFileSync('git', ['-C', cloneDir, ...args])
+      .toString()
+      .trim()
+
+  try {
+    const head = git('rev-parse', 'HEAD')
+
+    for (const base of ['no-such-branch', 'origin/no-such-branch', 'HEAD:missing.txt', 'HEAD~1..HEAD']) {
+      await assert.rejects(addWorktree(cloneDir, { base, branch: 'bogus' }, 'git'), undefined, base)
+    }
+
+    for (const [base, branch] of [
+      ['origin/main', 'from-remote'],
+      ['main', 'from-local'],
+      [head, 'from-sha']
+    ]) {
+      const result = await addWorktree(cloneDir, { base, branch }, 'git')
+
+      assert.equal(git('-C', result.path, 'rev-parse', 'HEAD'), head, base)
+      assert.equal(git('-C', result.path, 'branch', '--show-current'), branch, base)
+    }
+  } finally {
+    fs.rmSync(remoteDir, { recursive: true, force: true })
+    fs.rmSync(cloneDir, { recursive: true, force: true })
+  }
+})
+
+test('fetchRemoteBranch: option-shaped remote and branch names never reach git as options', async () => {
+  const { cloneDir, remoteDir } = seedRemoteAndClone('hostile-remote', [])
+  const { executed, payload, sink } = makeSink('hostile-remote')
+
+  try {
+    // A repo's config can carry any remote name, so a configured remote is not
+    // proof that the name is safe to put in argv.
+    const remotes = hostileValues(payload)
+
+    for (const remote of remotes) {
+      execFileSync('git', ['config', `remote.${remote}.url`, remoteDir], { cwd: cloneDir })
+    }
+
+    for (const remote of remotes) {
+      assert.equal(await fetchRemoteBranch('git', cloneDir, remote, 'main'), false, remote)
+    }
+
+    for (const branch of hostileValues(payload)) {
+      assert.equal(await fetchRemoteBranch('git', cloneDir, 'origin', branch), false, branch)
+    }
+
+    assert.equal(await fetchRemoteBranch('git', cloneDir, 'not-a-remote', 'main'), false)
+    assert.equal(await fetchRemoteBranch('git', cloneDir, 'origin', 'main:refs/heads/clobbered'), false)
+    assert.deepEqual(executed(), [])
+
+    assert.equal(await fetchRemoteBranch('git', cloneDir, 'origin', 'main'), true)
+  } finally {
+    for (const dir of [remoteDir, cloneDir, sink]) {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+// Every string over an alphabet of the characters that matter at a name's edge.
+function* edgeStrings(alphabet, maxLength) {
+  let level = ['']
+
+  for (let length = 1; length <= maxLength; length++) {
+    level = level.flatMap(prefix => alphabet.map(char => prefix + char))
+    yield* level
+  }
+}
+
+test('sanitizeBranch: never returns an option-shaped name', () => {
+  const inputs = [
+    ...edgeStrings(['-', '.', '/', ' ', '\t', '=', '~', 'a'], 5),
+    '--upload-pack=touch /tmp/x',
+    '-c core.pager=touch /tmp/x',
+    ' \t--x',
+    '日本-',
+    '\u00a0-x'
+  ]
+
+  for (const input of inputs) {
+    assert.equal(sanitizeBranch(input).startsWith('-'), false, JSON.stringify(input))
+  }
+})
+
+test('gitVersionProblem: git older than 2.30 is refused with the reason', () => {
+  for (const version of ['git version 2.23.0', 'git version 2.24.4', 'git version 2.29.3', 'git version 1.9']) {
+    assert.match(gitVersionProblem(version), /too old.*Git 2\.30\.0 or newer/, version)
+  }
+
+  for (const version of [
+    'git version 2.30.0',
+    'git version 2.43.0',
+    'git version 2.39.3 (Apple Git-145)',
+    'git version 2.45.1.windows.1',
+    'git version 3.0.0',
+    'not git output'
+  ]) {
+    assert.equal(gitVersionProblem(version), '', version)
+  }
+})
+
+test('addWorktree: an old git fails the flow with a clear error and creates nothing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-old-git-'))
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-old-git-bin-'))
+  const oldGit = path.join(bin, 'git')
+
+  fs.writeFileSync(
+    oldGit,
+    '#!/bin/sh\n[ "$1" = "--version" ] && { echo "git version 2.23.0"; exit 0; }\nexec git "$@"\n',
+    {
+      mode: 0o755
+    }
+  )
+
+  try {
+    await ensureGitRepo('git', dir)
+
+    for (const options of [{ branch: 'fresh' }, { base: 'HEAD', branch: 'fresh' }, { existingBranch: 'other' }]) {
+      await assert.rejects(addWorktree(dir, options, oldGit), /Git 2\.23\.0 is too old.*Git 2\.30\.0 or newer/)
+    }
+
+    assert.equal(fs.existsSync(path.join(dir, '.worktrees')), false)
+    assert.equal(execFileSync('git', ['branch', '--list', 'fresh'], { cwd: dir }).toString().trim(), '')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+    fs.rmSync(bin, { recursive: true, force: true })
   }
 })
