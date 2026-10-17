@@ -114,6 +114,40 @@ def _verified_commit(cwd: str, ref) -> str | None:
     return sha if _SHA_RE.fullmatch(sha) else None
 
 
+# Git's option parser learned `--end-of-options` in 2.24, and `git rev-parse` (which
+# resolves a base to its SHA) only in 2.30. On an older git every guarded call fails,
+# so the worktree flow refuses up front with the reason (Electron-op parity).
+_MIN_GIT_VERSION = (2, 30, 0)
+_supported_gits: set[str] = set()
+
+
+def _git_version_problem(version_output: str) -> str:
+    """Why this git cannot run the worktree flow, or "" when it can. An unreadable
+    version string is left for git itself to judge."""
+    match = re.search(r"git version (\d+)\.(\d+)(?:\.(\d+))?", version_output or "")
+    if not match:
+        return ""
+    found = tuple(int(part or 0) for part in match.groups())
+    if found >= _MIN_GIT_VERSION:
+        return ""
+    return (f"Git {'.'.join(map(str, found))} is too old. Hermes needs Git "
+            f"{'.'.join(map(str, _MIN_GIT_VERSION))} or newer to create worktrees. Update Git, then try again.")
+
+
+def _require_supported_git(cwd: str) -> None:
+    """Raise RuntimeError naming the version when git is too old. Only a passing check is
+    cached (per resolved binary), so updating git takes effect without a restart."""
+    binary = shutil.which("git") or "git"
+    if binary in _supported_gits:
+        return
+    version = _git_line(cwd, ["--version"])
+    problem = _git_version_problem(version)
+    if problem:
+        raise RuntimeError(problem)
+    if version:
+        _supported_gits.add(binary)
+
+
 def _fetch_remote_branch(cwd: str, remote: str, branch: str) -> bool:
     """Best-effort ``git fetch <remote> <branch>``; False without running fetch unless
     ``remote`` is a configured remote and ``branch`` a valid branch name."""
@@ -681,6 +715,7 @@ def _worktree_for_existing(root: str, raw_name: str) -> dict:
 
 
 def worktree_add(cwd: str, options: dict) -> dict:
+    _require_supported_git(cwd)
     _ensure_repo(cwd)
     root = _main_root(cwd)
     options = options or {}

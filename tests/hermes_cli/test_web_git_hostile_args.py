@@ -6,6 +6,7 @@ means git parsed request text as an option instead of a revision or a path.
 
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -179,3 +180,29 @@ def test_untracked_diff_fallback_stays_inside_the_repo(client, clone):
     assert "+brand new" in client.get("/api/git/review/diff", params={"path": str(clone), "file": "new.txt"}).json()["diff"]
     for file in ("new.txt", str(clone / "new.txt")):
         assert "+brand new" in client.get("/api/git/file-diff", params={"path": str(clone), "file": file}).json()["diff"]
+
+
+def test_git_version_problem_refuses_git_older_than_2_30():
+    for version in ("git version 2.23.0", "git version 2.24.4", "git version 2.29.3", "git version 1.9"):
+        assert re.search(r"too old.*Git 2\.30\.0 or newer", web_git._git_version_problem(version)), version
+    for version in ("git version 2.30.0", "git version 2.43.0", "git version 2.39.3 (Apple Git-145)",
+                    "git version 2.45.1.windows.1", "git version 3.0.0", "not git output"):
+        assert web_git._git_version_problem(version) == "", version
+
+
+def test_worktree_add_on_old_git_fails_with_a_clear_error(client, clone, tmp_path, monkeypatch):
+    real_git = shutil.which("git")
+    bin_dir = tmp_path / "old-git-bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "git"
+    fake.write_text(f'#!/bin/sh\n[ "$1" = "--version" ] && {{ echo "git version 2.23.0"; exit 0; }}\n'
+                    f'exec "{real_git}" "$@"\n', encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    for options in ({"branch": "fresh"}, {"branch": "fresh", "base": "main"}, {"existingBranch": "main"}):
+        resp = client.post("/api/git/worktree/add", json={"path": str(clone), **options})
+        assert resp.status_code == 400, options
+        assert re.search(r"Git 2\.23\.0 is too old.*Git 2\.30\.0 or newer", resp.json()["detail"]), options
+    assert not (clone / ".worktrees").exists()
+    assert _git(clone, "branch", "--list", "fresh") == ""

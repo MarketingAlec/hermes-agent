@@ -154,6 +154,53 @@ async function verifiedCommitSha(gitBin, cwd, ref) {
   return SHA_RE.test(sha) ? sha : ''
 }
 
+// Git's option parser learned `--end-of-options` in 2.24, and `git rev-parse`
+// (which resolves a base to its sha) only in 2.30. On an older git every
+// guarded call fails, so the worktree flow refuses up front with the reason.
+const MIN_GIT_VERSION = [2, 30, 0]
+
+// Why this git cannot run the worktree flow, or "" when it can. An unreadable
+// version string is left for git itself to judge.
+function gitVersionProblem(versionOutput) {
+  const match = /git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(String(versionOutput || ''))
+
+  if (!match) {
+    return ''
+  }
+
+  const found = match.slice(1).map(part => Number(part || 0))
+  const index = found.findIndex((part, i) => part !== MIN_GIT_VERSION[i])
+
+  if (index === -1 || found[index] > MIN_GIT_VERSION[index]) {
+    return ''
+  }
+
+  return (
+    `Git ${found.join('.')} is too old. Hermes needs Git ${MIN_GIT_VERSION.join('.')} or newer ` +
+    'to create worktrees. Update Git, then try again.'
+  )
+}
+
+// Only a passing check is cached, so updating git takes effect without a restart.
+const supportedGitBins = new Set()
+
+async function requireSupportedGit(gitBin, cwd) {
+  if (supportedGitBins.has(gitBin)) {
+    return
+  }
+
+  const version = await gitLine(gitBin, ['--version'], cwd)
+  const problem = gitVersionProblem(version)
+
+  if (problem) {
+    throw new Error(problem)
+  }
+
+  if (version) {
+    supportedGitBins.add(gitBin)
+  }
+}
+
 // Best-effort `git fetch <remote> <branch>`. False, without running fetch,
 // unless `remote` is a configured remote and `branch` a valid branch name.
 async function fetchRemoteBranch(gitBin, cwd, remote, branch) {
@@ -323,6 +370,7 @@ async function addExistingBranchWorktree(gitBin, root, name) {
 
 async function addWorktree(repoPath, options, gitBin) {
   const resolved = resolveRequestedPathForIpc(repoPath, { purpose: 'Worktree add' })
+  await requireSupportedGit(gitBin, resolved)
   // A new project's folder may not be a git repo yet — init it (with a root
   // commit) so the worktree has something to branch from.
   await ensureGitRepo(gitBin, resolved)
@@ -565,6 +613,7 @@ export {
   addWorktree,
   ensureGitRepo,
   fetchRemoteBranch,
+  gitVersionProblem,
   listBaseBranches,
   listBranches,
   listWorktrees,

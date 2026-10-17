@@ -10,6 +10,7 @@ import {
   addWorktree,
   ensureGitRepo,
   fetchRemoteBranch,
+  gitVersionProblem,
   listBaseBranches,
   listBranches,
   parseWorktrees,
@@ -530,6 +531,7 @@ test('addWorktree: option-shaped bases are rejected without running anything', a
 
 test('addWorktree: a base names a commit, and the worktree starts at that commit', async () => {
   const { cloneDir, remoteDir } = seedRemoteAndClone('base-commit', [])
+
   const git = (...args) =>
     execFileSync('git', ['-C', cloneDir, ...args])
       .toString()
@@ -588,5 +590,50 @@ test('fetchRemoteBranch: option-shaped remote and branch names never reach git a
     for (const dir of [remoteDir, cloneDir, sink]) {
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  }
+})
+
+test('gitVersionProblem: git older than 2.30 is refused with the reason', () => {
+  for (const version of ['git version 2.23.0', 'git version 2.24.4', 'git version 2.29.3', 'git version 1.9']) {
+    assert.match(gitVersionProblem(version), /too old.*Git 2\.30\.0 or newer/, version)
+  }
+
+  for (const version of [
+    'git version 2.30.0',
+    'git version 2.43.0',
+    'git version 2.39.3 (Apple Git-145)',
+    'git version 2.45.1.windows.1',
+    'git version 3.0.0',
+    'not git output'
+  ]) {
+    assert.equal(gitVersionProblem(version), '', version)
+  }
+})
+
+test('addWorktree: an old git fails the flow with a clear error and creates nothing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-old-git-'))
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-old-git-bin-'))
+  const oldGit = path.join(bin, 'git')
+
+  fs.writeFileSync(
+    oldGit,
+    '#!/bin/sh\n[ "$1" = "--version" ] && { echo "git version 2.23.0"; exit 0; }\nexec git "$@"\n',
+    {
+      mode: 0o755
+    }
+  )
+
+  try {
+    await ensureGitRepo('git', dir)
+
+    for (const options of [{ branch: 'fresh' }, { base: 'HEAD', branch: 'fresh' }, { existingBranch: 'other' }]) {
+      await assert.rejects(addWorktree(dir, options, oldGit), /Git 2\.23\.0 is too old.*Git 2\.30\.0 or newer/)
+    }
+
+    assert.equal(fs.existsSync(path.join(dir, '.worktrees')), false)
+    assert.equal(execFileSync('git', ['branch', '--list', 'fresh'], { cwd: dir }).toString().trim(), '')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+    fs.rmSync(bin, { recursive: true, force: true })
   }
 })
