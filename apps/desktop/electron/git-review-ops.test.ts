@@ -84,7 +84,12 @@ test('ref-taking review ops reject option-shaped refs without running them', asy
 test('ref-taking review ops reject values that are not a commit in the repo', async () => {
   const dir = makeRepo()
 
-  for (const ref of ['no-such-branch', 'HEAD:tracked.txt', 'HEAD~1..HEAD']) {
+  // A second commit makes the ranges resolvable, so rev-parse prints several
+  // revisions for them instead of failing outright.
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'second\n')
+  git(dir, ['commit', '-qam', 'second'])
+
+  for (const ref of ['no-such-branch', 'HEAD:tracked.txt', 'HEAD~1..HEAD', 'HEAD~1...HEAD']) {
     assert.equal(await reviewRevParse(dir, ref, 'git'), null, ref)
     assert.deepEqual(await reviewList(dir, 'lastTurn', ref, 'git'), { files: [], base: null }, ref)
     assert.equal(await reviewDiff(dir, 'tracked.txt', 'lastTurn', ref, false, 'git'), '', ref)

@@ -153,14 +153,21 @@ async function fillUntrackedCounts(cwd, files) {
 // Renderer-supplied refs land in a positional argv slot where git would parse an
 // option-shaped value as a flag (`--output=<path>` makes `git diff` write any
 // file). Fail closed: refuse option-shaped values, require the value to name a
-// commit, and hand git the resolved sha rather than the caller's text.
+// commit, and hand git the resolved sha rather than the caller's text. A range
+// makes rev-parse exit 1 with empty stderr (which simple-git does not treat as
+// failure) while still printing several revisions, so only a lone SHA-1 or
+// SHA-256 object id counts as success.
+const COMMIT_SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/
+
 async function verifiedCommit(git, ref) {
   if (typeof ref !== 'string' || !ref || ref.startsWith('-')) {
     return null
   }
 
   try {
-    return (await git.raw(['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{commit}`])).trim() || null
+    const sha = (await git.raw(['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{commit}`])).trim()
+
+    return COMMIT_SHA_RE.test(sha) ? sha : null
   } catch {
     return null
   }
