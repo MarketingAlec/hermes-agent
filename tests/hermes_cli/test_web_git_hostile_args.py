@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -189,6 +190,23 @@ def test_sanitize_branch_never_returns_an_option_shaped_name():
     inputs += ["--upload-pack=touch /tmp/x", "-c core.pager=touch /tmp/x", " \t--x", "日本-", "\u00a0-x"]
     for raw in inputs:
         assert not web_git._sanitize_branch(raw).startswith("-"), repr(raw)
+
+
+def test_sanitize_branch_refuses_an_option_shaped_result_even_under_python_O():
+    probe = (
+        "from hermes_cli import web_git\n"
+        "web_git._BRANCH_SANITIZERS = ()\n"
+        "try:\n"
+        "    web_git._sanitize_branch('--upload-pack=touch /tmp/x')\n"
+        "except ValueError as exc:\n"
+        "    print('refused:', exc)\n"
+        "else:\n"
+        "    print('accepted')\n"
+    )
+    for flags in ([], ["-O"]):
+        out = subprocess.run([sys.executable, *flags, "-c", probe], capture_output=True, text=True,
+                             cwd=Path(web_git.__file__).resolve().parents[1], check=True).stdout
+        assert out.startswith("refused: _sanitize_branch produced an option-shaped"), (flags, out)
 
 
 def test_git_version_problem_refuses_git_older_than_2_30():

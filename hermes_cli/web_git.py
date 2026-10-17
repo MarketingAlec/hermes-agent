@@ -638,7 +638,9 @@ def _sanitize_branch(name: str) -> str:
     for pattern, repl in _BRANCH_SANITIZERS:
         value = re.sub(pattern, repl, value)
     # Callers put the result in argv unguarded (`-b <branch>`, `switch <branch>`).
-    assert not value.startswith("-"), "_sanitize_branch produced an option-shaped branch name"
+    # An explicit raise, not assert: `python -O` strips asserts.
+    if value.startswith("-"):
+        raise ValueError("_sanitize_branch produced an option-shaped branch name")
     return value
 
 
