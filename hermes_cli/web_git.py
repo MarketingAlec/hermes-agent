@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -90,6 +91,72 @@ def _origin_head_abbrev(cwd: str) -> str:
 
 def _ref_exists(cwd: str, ref: str) -> bool:
     return _git(cwd, ["rev-parse", "--verify", "--quiet", ref])[0] == 0
+
+
+# ── caller-supplied refs and paths ───────────────────────────────────────────
+# Refs and paths arrive from REST requests and land in positional argv slots, where
+# git parses an option-shaped value as a flag (`--output=<path>` writes any file,
+# `fetch origin --upload-pack=<cmd>` runs a command). Fail closed and hand git only
+# values it cannot read as options.
+
+_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _option_shaped(value) -> bool:
+    return not isinstance(value, str) or not value or value.startswith("-")
+
+
+def _verified_commit(cwd: str, ref) -> str | None:
+    """The full SHA of the commit ``ref`` names, or None."""
+    if _option_shaped(ref):
+        return None
+    sha = _git_line(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options", f"{ref}^{{commit}}"])
+    return sha if _SHA_RE.fullmatch(sha) else None
+
+
+def _fetch_remote_branch(cwd: str, remote: str, branch: str) -> bool:
+    """Best-effort ``git fetch <remote> <branch>``; False without running fetch unless
+    ``remote`` is a configured remote and ``branch`` a valid branch name."""
+    if _option_shaped(remote) or _option_shaped(branch):
+        return False
+    if _git(cwd, ["check-ref-format", f"refs/heads/{branch}"])[0] != 0:
+        return False
+    if remote not in _git_out(cwd, ["remote"]).splitlines():
+        return False
+    return _git(cwd, ["fetch", "--end-of-options", remote, branch])[0] == 0
+
+
+def _repo_relative(cwd: str, file_path: str) -> str | None:
+    """``file_path`` (absolute, or relative to ``cwd``) as a path relative to ``cwd``, or None.
+    Only the parent is resolved, so a symlink named by the caller stays a symlink."""
+    if not os.path.isabs(file_path):
+        return file_path
+    try:
+        parent = Path(file_path).parent.resolve(strict=True)
+        return os.path.relpath(parent / Path(file_path).name, Path(cwd).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _contained_path(cwd: str, file_path) -> str | None:
+    """``file_path`` when it is relative, has no ``..``, and resolves (symlinks
+    included) to a file inside the repo's work tree outside ``.git``; else None."""
+    if not isinstance(file_path, str) or not file_path or "\0" in file_path:
+        return None
+    if os.path.isabs(file_path) or ntpath.isabs(file_path) or ".." in re.split(r"[\\/]", file_path):
+        return None
+    top = _git_line(cwd, ["rev-parse", "--show-toplevel"])
+    if not top:
+        return None
+    try:
+        root = Path(top).resolve(strict=True)
+        real = (Path(cwd) / file_path).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not real.is_relative_to(root):
+        return None
+    parts = real.relative_to(root).parts
+    return file_path if parts and ".git" not in (p.lower() for p in parts) else None
 
 
 # ── shared helpers ───────────────────────────────────────────────────────────
@@ -249,7 +316,7 @@ def review_list(cwd: str, scope: str, base_ref: str | None) -> dict:
     if not _is_dir(cwd):
         return {"files": [], "base": None}
     if scope in ("branch", "lastTurn"):
-        base = _branch_base(cwd) if scope == "branch" else base_ref
+        base = _branch_base(cwd) if scope == "branch" else _verified_commit(cwd, base_ref)
         if not base:
             return {"files": [], "base": None}
         rng = f"{base}...HEAD" if scope == "branch" else base
@@ -280,9 +347,11 @@ def review_list(cwd: str, scope: str, base_ref: str | None) -> dict:
     return _review_result(cwd, files, None)
 
 
-def _all_add_diff(cwd: str, file_path: str) -> str:
-    """Synthesized all-add diff for an untracked file (``--no-index`` exits non-zero by design)."""
-    return _git(cwd, ["diff", "--no-index", "--", os.devnull, file_path])[1]
+def _all_add_diff(cwd: str, file_path: str | None) -> str:
+    """Synthesized all-add diff for an untracked file (``--no-index`` exits non-zero by design).
+    ``--no-index`` reads any file on disk, so only a path contained in the repo reaches it."""
+    contained = _contained_path(cwd, file_path)
+    return _git(cwd, ["diff", "--no-index", "--", os.devnull, contained])[1] if contained else ""
 
 
 def review_diff(cwd: str, file_path: str, scope: str, base_ref: str | None, staged: bool) -> str:
@@ -292,7 +361,8 @@ def review_diff(cwd: str, file_path: str, scope: str, base_ref: str | None, stag
         base = _branch_base(cwd)
         return _git_out(cwd, ["diff", f"{base}...HEAD", "--", file_path]) if base else ""
     if scope == "lastTurn":
-        return _git_out(cwd, ["diff", base_ref, "--", file_path]) if base_ref else ""
+        base = _verified_commit(cwd, base_ref)
+        return _git_out(cwd, ["diff", base, "--", file_path]) if base else ""
     if staged:
         return _git_out(cwd, ["diff", "--cached", "--", file_path])
     worktree = _git_out(cwd, ["diff", "--", file_path])
@@ -308,7 +378,8 @@ def file_diff_vs_head(cwd: str, file_path: str) -> str:
     if head.strip():
         return head
     status = _git_out(cwd, ["status", "--porcelain", "--", file_path])
-    return _all_add_diff(cwd, file_path) if status.strip().startswith("??") else ""
+    # The preview names files by absolute path.
+    return _all_add_diff(cwd, _repo_relative(cwd, file_path)) if status.strip().startswith("??") else ""
 
 
 def review_stage(cwd: str, file_path: str | None) -> dict:
@@ -330,7 +401,7 @@ def review_revert(cwd: str, file_path: str | None) -> dict:
 
 
 def review_rev_parse(cwd: str, ref: str | None) -> str | None:
-    return _git_line(cwd, ["rev-parse", ref or "HEAD"]) or None
+    return _verified_commit(cwd, ref or "HEAD")
 
 
 def _has_staged(raw: str) -> bool:
@@ -593,6 +664,8 @@ def _worktree_for_existing(root: str, raw_name: str) -> dict:
     # #81724)
     remote = _remote_of_ref(root, requested)
     existing = requested.split("/", 1)[1] if remote else requested
+    if _option_shaped(existing):
+        raise RuntimeError("Branch name is required.")
     if not remote and existing == _default_branch(root):
         _git_ok(root, ["switch", existing])
         return {"path": root, "branch": existing, "repoRoot": root}
@@ -600,10 +673,10 @@ def _worktree_for_existing(root: str, raw_name: str) -> dict:
     if remote:
         # Best-effort freshness; on failure (offline, branch gone) the last known ref is still
         # there to branch from.
-        _git(root, ["fetch", remote, existing])
-        _git_ok(root, ["worktree", "add", "--track", "-b", existing, target, requested])
+        _fetch_remote_branch(root, remote, existing)
+        _git_ok(root, ["worktree", "add", "--track", "-b", existing, "--end-of-options", target, requested])
     else:
-        _git_ok(root, ["worktree", "add", target, existing])
+        _git_ok(root, ["worktree", "add", "--end-of-options", target, existing])
     return {"path": target, "branch": existing, "repoRoot": root}
 
 
@@ -617,23 +690,27 @@ def worktree_add(cwd: str, options: dict) -> dict:
     slug = _slugify(options.get("name") or f"work-{os.urandom(4).hex()}")
     branch = _sanitize_branch(options.get("branch") or "") or f"hermes/{slug}"
     target = _unique_dir(os.path.join(root, ".worktrees", slug))
-    args = ["worktree", "add", "-b", branch, target]
+    flags: list[str] = []
+    start: list[str] = []
     if options.get("base"):
         base = str(options["base"])
         # Fetch just that branch so a stale remote-tracking ref is fresh; fetch failures
-        # (offline / no remote) are ignored — git uses the local ref or raises a clear error
-        # below if it is entirely missing.
+        # (offline / no remote) are ignored — the local ref is used, and a base that names
+        # no commit at all is refused below.
         if base.startswith("origin/"):
-            _git(root, ["fetch", "origin", base[len("origin/"):]])
+            _fetch_remote_branch(root, "origin", base[len("origin/"):])
             # Branching off a remote-tracking ref auto-wires upstream tracking; the user wants
             # a standalone local branch (Electron-op parity).
-            args.append("--no-track")
-        args.append(base)
-    code, _, err = _git(root, args)
+            flags.append("--no-track")
+        sha = _verified_commit(root, base)
+        if not sha:
+            raise RuntimeError(f"Base {base!r} is not a commit in this repository.")
+        start.append(sha)
+    code, _, err = _git(root, ["worktree", "add", *flags, "-b", branch, "--end-of-options", target, *start])
     if code != 0:
         if "already exists" not in (err or "").lower():
             raise RuntimeError(err.strip() or "git worktree add failed")
-        _git_ok(root, ["worktree", "add", target, branch])
+        _git_ok(root, ["worktree", "add", "--end-of-options", target, branch])
     return {"path": target, "branch": branch, "repoRoot": root}
 
 
