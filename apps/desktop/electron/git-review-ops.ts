@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-import simpleGit from 'simple-git'
+import { simpleGit } from 'simple-git'
 
 import { resolveRequestedPathForIpc } from './hardening'
 
@@ -150,6 +150,29 @@ async function fillUntrackedCounts(cwd, files) {
   }
 }
 
+// Renderer-supplied refs land in a positional argv slot where git would parse an
+// option-shaped value as a flag (`--output=<path>` makes `git diff` write any
+// file). Fail closed: refuse option-shaped values, require the value to name a
+// commit, and hand git the resolved sha rather than the caller's text. A range
+// makes rev-parse exit 1 with empty stderr (which simple-git does not treat as
+// failure) while still printing several revisions, so only a lone SHA-1 or
+// SHA-256 object id counts as success.
+const COMMIT_SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/
+
+async function verifiedCommit(git, ref) {
+  if (typeof ref !== 'string' || !ref || ref.startsWith('-')) {
+    return null
+  }
+
+  try {
+    const sha = (await git.raw(['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{commit}`])).trim()
+
+    return COMMIT_SHA_RE.test(sha) ? sha : null
+  } catch {
+    return null
+  }
+}
+
 // Resolve the base ref for "all branch changes": merge-base with the remote
 // default branch (origin/HEAD), falling back to common trunk names.
 async function branchBase(git) {
@@ -245,7 +268,7 @@ async function reviewList(repoPath, scope, baseRef, gitBin) {
 
   try {
     if (scope === 'branch' || scope === 'lastTurn') {
-      const base = scope === 'branch' ? await branchBase(git) : baseRef
+      const base = scope === 'branch' ? await branchBase(git) : await verifiedCommit(git, baseRef)
 
       if (!base) {
         return { files: [], base: null }
@@ -344,7 +367,9 @@ async function reviewDiff(repoPath, filePath, scope, baseRef, staged, gitBin) {
   }
 
   if (scope === 'lastTurn') {
-    return baseRef ? safe([baseRef, '--', filePath]) : ''
+    const base = await verifiedCommit(git, baseRef)
+
+    return base ? safe([base, '--', filePath]) : ''
   }
 
   if (staged) {
@@ -452,7 +477,7 @@ async function reviewRevParse(repoPath, ref, gitBin) {
   }
 
   try {
-    return (await gitFor(cwd, gitBin).revparse([ref || 'HEAD'])).trim() || null
+    return await verifiedCommit(gitFor(cwd, gitBin), ref || 'HEAD')
   } catch {
     return null
   }

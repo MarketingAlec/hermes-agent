@@ -6,7 +6,18 @@ import path from 'node:path'
 
 import { afterEach, test } from 'vitest'
 
-import { gitFor, repoStatus, resolveRenamePath, REVIEW_FILE_CAP, reviewList } from './git-review-ops'
+import {
+  gitFor,
+  repoStatus,
+  resolveRenamePath,
+  REVIEW_FILE_CAP,
+  reviewCommit,
+  reviewDiff,
+  reviewList,
+  reviewPush,
+  reviewRevParse,
+  reviewStage
+} from './git-review-ops'
 
 const tempDirs: string[] = []
 
@@ -23,12 +34,141 @@ function makeRepo() {
   execFileSync('git', ['init', '-q'], { cwd: dir })
   execFileSync('git', ['config', 'user.email', 'hermes-test@example.com'], { cwd: dir })
   execFileSync('git', ['config', 'user.name', 'Hermes Test'], { cwd: dir })
+  // A developer's global signing / fsmonitor setup must not reach fixture repos.
+  execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: dir })
+  execFileSync('git', ['config', 'core.fsmonitor', 'false'], { cwd: dir })
   fs.writeFileSync(path.join(dir, 'tracked.txt'), 'tracked\n')
   execFileSync('git', ['add', 'tracked.txt'], { cwd: dir })
   execFileSync('git', ['commit', '-qm', 'initial'], { cwd: dir })
 
   return dir
 }
+
+function makeTempDir(prefix: string) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+
+  tempDirs.push(dir)
+
+  return dir
+}
+
+const git = (cwd: string, args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+
+// Option-shaped values a compromised renderer could put in a ref slot. Each one
+// would act on the machine if git parsed it as a flag instead of a revision.
+function hostileRefs(sink: string) {
+  return [
+    `--output=${path.join(sink, 'diff-output')}`,
+    `-c core.pager=touch ${path.join(sink, 'pager')}`,
+    `-ccore.pager=touch ${path.join(sink, 'pager-attached')}`,
+    `--upload-pack=touch ${path.join(sink, 'upload-pack')}`,
+    '-'
+  ]
+}
+
+test('ref-taking review ops reject option-shaped refs without running them', async () => {
+  const dir = makeRepo()
+  const sink = makeTempDir('hermes-desktop-git-sink-')
+
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'changed\n')
+
+  for (const ref of hostileRefs(sink)) {
+    assert.equal(await reviewRevParse(dir, ref, 'git'), null, ref)
+    assert.deepEqual(await reviewList(dir, 'lastTurn', ref, 'git'), { files: [], base: null }, ref)
+    assert.equal(await reviewDiff(dir, 'tracked.txt', 'lastTurn', ref, false, 'git'), '', ref)
+  }
+
+  assert.deepEqual(fs.readdirSync(sink), [])
+})
+
+test('ref-taking review ops reject values that are not a commit in the repo', async () => {
+  const dir = makeRepo()
+
+  // A second commit makes the ranges resolvable, so rev-parse prints several
+  // revisions for them instead of failing outright.
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'second\n')
+  git(dir, ['commit', '-qam', 'second'])
+
+  for (const ref of ['no-such-branch', 'HEAD:tracked.txt', 'HEAD~1..HEAD', 'HEAD~1...HEAD']) {
+    assert.equal(await reviewRevParse(dir, ref, 'git'), null, ref)
+    assert.deepEqual(await reviewList(dir, 'lastTurn', ref, 'git'), { files: [], base: null }, ref)
+    assert.equal(await reviewDiff(dir, 'tracked.txt', 'lastTurn', ref, false, 'git'), '', ref)
+  }
+})
+
+test('ref-taking review ops resolve ordinary refs to the commit they name', async () => {
+  const dir = makeRepo()
+  const base = git(dir, ['rev-parse', 'HEAD'])
+
+  git(dir, ['tag', 'v1'])
+  git(dir, ['branch', 'feature/x'])
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'second\n')
+  git(dir, ['commit', '-qam', 'second'])
+
+  const head = git(dir, ['rev-parse', 'HEAD'])
+
+  assert.equal(await reviewRevParse(dir, null, 'git'), head)
+  assert.equal(await reviewRevParse(dir, 'HEAD', 'git'), head)
+
+  for (const ref of [base, base.slice(0, 10), 'v1', 'feature/x', 'HEAD~1', 'HEAD^']) {
+    assert.equal(await reviewRevParse(dir, ref, 'git'), base, ref)
+
+    const list = await reviewList(dir, 'lastTurn', ref, 'git')
+
+    assert.equal(list.base, base, ref)
+    assert.deepEqual(
+      list.files.map(file => file.path),
+      ['tracked.txt'],
+      ref
+    )
+    assert.match(String(await reviewDiff(dir, 'tracked.txt', 'lastTurn', ref, false, 'git')), /^\+second$/m, ref)
+  }
+})
+
+test('option-shaped file names and commit messages are committed literally', async () => {
+  const dir = makeRepo()
+  const sink = makeTempDir('hermes-desktop-git-sink-')
+  // File names can't hold a separator, so their payload targets the repo cwd.
+  const fileNames = ['--upload-pack=touch pwned-by-file', '-c']
+  const message = `--upload-pack=touch ${path.join(sink, 'message')}`
+
+  for (const name of fileNames) {
+    fs.writeFileSync(path.join(dir, name), `${name}\n`)
+  }
+
+  for (const name of fileNames) {
+    await reviewStage(dir, name, 'git')
+    const diff = String(await reviewDiff(dir, name, 'uncommitted', null, true, 'git'))
+
+    assert.match(diff, new RegExp(`^\\+${name}$`, 'm'))
+  }
+
+  await reviewCommit(dir, `${message}\n\n-c core.pager=touch ${path.join(sink, 'body')}`, false, 'git')
+
+  assert.equal(git(dir, ['log', '-1', '--format=%s']), message)
+  assert.deepEqual(git(dir, ['show', '--name-only', '--format=', 'HEAD']).split('\n').sort(), [...fileNames].sort())
+  assert.equal(fs.existsSync(path.join(dir, 'pwned-by-file')), false)
+  assert.deepEqual(fs.readdirSync(sink), [])
+})
+
+test('push refuses hostile remote URLs without running them', async () => {
+  const sink = makeTempDir('hermes-desktop-git-sink-')
+
+  const urls = [
+    `--upload-pack=touch ${path.join(sink, 'upload-pack')}`,
+    `ssh://-oProxyCommand=touch%20${path.join(sink, 'proxy')}/repo.git`,
+    `ext::sh -c touch% ${path.join(sink, 'ext')}`
+  ]
+
+  for (const url of urls) {
+    const dir = makeRepo()
+
+    git(dir, ['config', 'remote.origin.url', url])
+    await assert.rejects(reviewPush(dir, 'git'), undefined, url)
+  }
+
+  assert.deepEqual(fs.readdirSync(sink), [])
+})
 
 test('resolveRenamePath: plain path is unchanged', () => {
   assert.equal(resolveRenamePath('src/a.ts'), 'src/a.ts')
