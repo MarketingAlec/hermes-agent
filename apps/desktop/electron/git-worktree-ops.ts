@@ -135,6 +135,43 @@ async function gitOk(gitBin, args, cwd) {
   }
 }
 
+// Refs and remote names arrive from the renderer and land in positional argv
+// slots, where git parses an option-shaped value as a flag (`git fetch origin
+// --upload-pack=<cmd>` runs the command). Fail closed and hand git only values
+// that it cannot read as options.
+const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+
+const optionShaped = value => typeof value !== 'string' || !value || value.startsWith('-')
+
+// The full sha of the commit that `ref` names, or "".
+async function verifiedCommitSha(gitBin, cwd, ref) {
+  if (optionShaped(ref)) {
+    return ''
+  }
+
+  const sha = await gitLine(gitBin, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{commit}`], cwd)
+
+  return SHA_RE.test(sha) ? sha : ''
+}
+
+// Best-effort `git fetch <remote> <branch>`. False, without running fetch,
+// unless `remote` is a configured remote and `branch` a valid branch name.
+async function fetchRemoteBranch(gitBin, cwd, remote, branch) {
+  if (optionShaped(remote) || optionShaped(branch)) {
+    return false
+  }
+
+  if (!(await gitOk(gitBin, ['check-ref-format', `refs/heads/${branch}`], cwd))) {
+    return false
+  }
+
+  if (!(await gitLine(gitBin, ['remote'], cwd)).split('\n').includes(remote)) {
+    return false
+  }
+
+  return gitOk(gitBin, ['fetch', '--end-of-options', remote, branch], cwd)
+}
+
 // The remote that a ref belongs to ("origin" for "origin/main"), or "" when the
 // name is not a remote-tracking ref in this repo. This function asks git. It
 // does not assume that the remote has the name "origin", because a repo can
@@ -256,6 +293,10 @@ async function addExistingBranchWorktree(gitBin, root, name) {
   const remote = await remoteOfRef(gitBin, root, requested)
   const branch = remote ? requested.slice(remote.length + 1) : requested
 
+  if (optionShaped(branch)) {
+    throw new Error('Branch name is required.')
+  }
+
   if (!remote && branch === (await defaultBranch(gitBin, root))) {
     await runGit(gitBin, ['switch', branch], root)
 
@@ -267,20 +308,15 @@ async function addExistingBranchWorktree(gitBin, root, name) {
   if (remote) {
     // The remote-tracking ref is stale if the user did not fetch recently. This
     // fetch is best effort: after a failure, the last known ref is still there
-    // to branch from.
-    try {
-      await runGit(gitBin, ['fetch', remote, branch], root)
-    } catch {
-      // The user is offline, or the branch is gone from the remote. Use the ref
-      // that the repo already has.
-    }
-
-    await runGit(gitBin, ['worktree', 'add', '--track', '-b', branch, dir, requested], root)
+    // to branch from. A false result means the user is offline, or the branch
+    // is gone from the remote. Use the ref that the repo already has.
+    await fetchRemoteBranch(gitBin, root, remote, branch)
+    await runGit(gitBin, ['worktree', 'add', '--track', '-b', branch, '--end-of-options', dir, requested], root)
 
     return { path: dir, branch, repoRoot: root }
   }
 
-  await runGit(gitBin, ['worktree', 'add', dir, branch], root)
+  await runGit(gitBin, ['worktree', 'add', '--end-of-options', dir, branch], root)
 
   return { path: dir, branch, repoRoot: root }
 }
@@ -301,7 +337,8 @@ async function addWorktree(repoPath, options, gitBin) {
   const branch = sanitizeBranch(opts.branch) || `hermes/${slug}`
   const dir = uniqueDir(path.join(root, '.worktrees', slug))
 
-  const args = ['worktree', 'add', '-b', branch, dir]
+  const flags = []
+  const start = []
 
   if (opts.base) {
     // Remote-tracking branches may be stale or missing if the user hasn't
@@ -311,34 +348,34 @@ async function addWorktree(repoPath, options, gitBin) {
     const base = String(opts.base)
 
     if (base.startsWith('origin/')) {
-      const remoteBranch = base.slice('origin/'.length)
-
-      try {
-        await runGit(gitBin, ['fetch', 'origin', remoteBranch], root)
-      } catch {
-        // The fetch isn't mandatory, but it would be nice to do if possible.
-        // If it's not possible, just use the local ref of the remote branch.
-        // If it doesn't exist locally, we'll get an error
-      }
+      // The fetch isn't mandatory, but it would be nice to do if possible.
+      // If it's not possible, just use the local ref of the remote branch.
+      await fetchRemoteBranch(gitBin, root, 'origin', base.slice('origin/'.length))
 
       // When branching off a remote-tracking ref, git auto-sets up tracking
       // (e.g. `new-branch` → tracks `origin/main`). The user almost certainly
       // wants a standalone local branch — like `git checkout origin/main &&
       // git checkout -b new-branch` — not a branch silently wired to the
       // remote's upstream. `--no-track` prevents that.
-      args.push('--no-track')
+      flags.push('--no-track')
     }
 
-    args.push(base)
+    const sha = await verifiedCommitSha(gitBin, root, base)
+
+    if (!sha) {
+      throw new Error(`Base "${base}" is not a commit in this repository.`)
+    }
+
+    start.push(sha)
   }
 
   try {
-    await runGit(gitBin, args, root)
+    await runGit(gitBin, ['worktree', 'add', ...flags, '-b', branch, '--end-of-options', dir, ...start], root)
   } catch (err) {
     // Branch name may already exist — retry checking out the existing branch
     // into a fresh worktree dir instead of failing the whole flow.
     if (/already exists/i.test(err.stderr || '')) {
-      await runGit(gitBin, ['worktree', 'add', dir, branch], root)
+      await runGit(gitBin, ['worktree', 'add', '--end-of-options', dir, branch], root)
     } else {
       throw err
     }
@@ -527,6 +564,7 @@ async function listBaseBranches(repoPath, gitBin) {
 export {
   addWorktree,
   ensureGitRepo,
+  fetchRemoteBranch,
   listBaseBranches,
   listBranches,
   listWorktrees,
